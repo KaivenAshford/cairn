@@ -18,10 +18,11 @@ const { Content } = await render(entry);
 ---
 
 <Base title={displayTitle(entry)} description={excerpt(entry, 140)} noindex={true}>
-  <article class="entry">
+  {/* 同 /e/：data-type 决定这一页穿哪一支颜色 */}
+  <article class="entry" data-type={entry.data.type}>
     <h1>{displayTitle(entry)}</h1>
     <div class="meta">
-      <span class="chip">{TYPE_LABEL[entry.data.type] ?? entry.data.type}</span>
+      <span class="chip" data-type={entry.data.type}>{TYPE_LABEL[entry.data.type] ?? entry.data.type}</span>
       {' '}<time datetime={entry.data.created.toISOString()}>{formatDate(entry.data.created)}</time>
       {' '}· 未列出，仅通过链接访问
     </div>

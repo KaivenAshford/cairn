@@ -34,8 +34,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# 每次运行的 fixture 前缀带随机后缀，从根上消掉和真实条目撞名的可能。
+T="zz-$(openssl rand -hex 4)"
+
 entry() { # entry <文件名> <内容>
   local path="$ENTRIES/$1.md"
+  # 内容目录是一个单独的 private 仓库，里面是真实内容，不是测试的暂存区。
+  # 撞名就停下：它不进代码仓的 git，被覆盖或删掉就真的没了。
+  if [ -e "$path" ]; then
+    echo >&2 "拒绝覆盖已存在的 $path"
+    echo >&2 "  内容目录是你的真实内容。请把那条条目挪开，或改这个测试的 fixture 名。"
+    exit 1
+  fi
   MADE+=("$path")
   mkdir -p "$(dirname "$path")"
   printf '%s\n' "$2" > "$path"
@@ -52,7 +62,7 @@ leaks() { grep -rqF "$1" web/dist 2>/dev/null; }
 echo "可见度安全性质："
 
 # ── 1. private / circle 条目不进产物，一个字都不能漏 ─────────────────────────
-entry zz-private '---
+entry "$T-private" '---
 title: ZZ_PRIVATE_TITLE 不该出现在产物里
 type: post
 visibility: private
@@ -61,7 +71,7 @@ tags: [ZZ_PRIVATE_TAG]
 ---
 
 ZZ_PRIVATE_BODY'
-entry zz-circle '---
+entry "$T-circle" '---
 title: ZZ_CIRCLE_TITLE
 type: note
 visibility: circle
@@ -75,7 +85,7 @@ if build >/dev/null; then
     if leaks "$marker"; then bad "private/circle 的 '$marker' 出现在了 dist 里"; hit=1; fi
   done
   [ "$hit" -eq 0 ] && ok "private 与 circle 的标题、正文、标签、id 都不进 dist"
-  if [ -e web/dist/e/zz-private ] || [ -e web/dist/e/zz-circle ]; then
+  if [ -e web/dist/e/$T-private ] || [ -e web/dist/e/$T-circle ]; then
     bad "private/circle 条目生成了页面"
   else
     ok "private 与 circle 条目不生成页面"
@@ -83,10 +93,10 @@ if build >/dev/null; then
 else
   bad "混入 private/circle 条目让构建失败了——它们应当被过滤掉，不是让构建挂掉"
 fi
-rm -f "$ENTRIES/zz-private.md" "$ENTRIES/zz-circle.md"
+rm -f "$ENTRIES/$T-private.md" "$ENTRIES/$T-circle.md"
 
 # ── 2. 忘写 visibility → 默认 private → 同样不进产物 ─────────────────────────
-entry zz-novis '---
+entry "$T-novis" '---
 title: ZZ_NOVIS_TITLE
 type: log
 created: 2026-01-01
@@ -102,11 +112,11 @@ if build >/dev/null; then
 else
   bad "忘写 visibility 让构建失败了"
 fi
-rm -f "$ENTRIES/zz-novis.md"
+rm -f "$ENTRIES/$T-novis.md"
 
 # ── 3. unlisted 用了猜得到的文件名 → 大声失败 ────────────────────────────────
 # 这是唯一一层强度取决于文件名的可见度，所以它必须失败，而不是被悄悄过滤掉。
-entry zz-guessable '---
+entry "$T-guessable" '---
 title: 猜得到的文件名
 type: log
 visibility: unlisted
@@ -116,15 +126,15 @@ created: 2026-01-01
 ZZ_GUESSABLE_BODY'
 if out=$(build); then
   bad "unlisted 用可猜的文件名，构建居然通过了"
-elif ! grep -qF "zz-guessable" <<<"$out"; then
+elif ! grep -qF "$T-guessable" <<<"$out"; then
   bad "unlisted 文件名检查失败了，但没说清是哪一条"
 else
   ok "unlisted 用可猜的文件名会让构建失败"
 fi
-rm -f "$ENTRIES/zz-guessable.md"
+rm -f "$ENTRIES/$T-guessable.md"
 
 # ── 4. 非法 type / 拼错的 visibility → schema 拒绝（fail-closed） ────────────
-entry zz-badtype '---
+entry "$T-badtype" '---
 type: video
 visibility: public
 created: 2026-01-01
@@ -132,9 +142,9 @@ created: 2026-01-01
 
 ZZ_BADTYPE_BODY'
 if build >/dev/null; then bad "非法 type 居然通过了"; else ok "非法 type 被 schema 拒绝"; fi
-rm -f "$ENTRIES/zz-badtype.md"
+rm -f "$ENTRIES/$T-badtype.md"
 
-entry zz-typo '---
+entry "$T-typo" '---
 type: log
 visibility: pubic
 created: 2026-01-01
@@ -142,7 +152,7 @@ created: 2026-01-01
 
 ZZ_TYPO_BODY'
 if build >/dev/null; then bad "visibility 拼错居然通过了"; else ok "visibility 拼错时 fail-closed"; fi
-rm -f "$ENTRIES/zz-typo.md"
+rm -f "$ENTRIES/$T-typo.md"
 
 # ── 5. 合法的 unlisted：随机路径、noindex、不上首页、不漏进别的产物 ──────────
 RAND=$(openssl rand -hex 16)
@@ -200,7 +210,7 @@ rm -rf "$ENTRIES/2026"
 #
 # 注意下面那个标记不带下划线：带的话，「下划线被当斜体吃掉」这条缺陷会连标记一起改写，
 # grep 于是永远匹配不到，测试看起来通过了——一个测自己测不出来的测试。
-entry zz-excerpt '---
+entry "$T-excerpt" '---
 type: log
 visibility: public
 created: 2026-01-01
@@ -225,11 +235,155 @@ if build >/dev/null; then
 else
   bad "含代码的条目让构建失败了"
 fi
-rm -f "$ENTRIES/zz-excerpt.md"
+rm -f "$ENTRIES/$T-excerpt.md"
 
-# ── 8. 构建失败时不能把已发布的产物留在半截状态 ──────────────────────────────
+# ── 8. 卡片版式：六色 chip、清单铺项、外链域名、筛选不连坐 ─────────────────
+# 这些不是安全性质，但它们是「卡片按 type 长得不一样」这版设计的**前提**：
+# 少了 data-type，六种颜色全部退回默认色，整版设计就只剩白卡。
+entry "$T-list" '---
+title: 在读
+type: list
+visibility: public
+created: 2026-01-02
+---
+
+- 《档案：一部社会史》
+- 《中文排版需求》
+- 《The Design of Everyday Things》'
+entry "$T-link" '---
+type: link
+visibility: public
+created: 2026-01-01
+---
+
+[TypeScript 的 Go 移植版](https://github.com/microsoft/typescript-go) —— 编译器换宿主语言。'
+if build >/dev/null; then
+  home=web/dist/index.html
+  n=$(grep -o 'class="chip" data-type="[a-z]*"' "$home" | sort -u | wc -l)
+  if [ "$n" -ge 3 ]; then ok "chip 带 data-type（$n 种），六色配色才成立"
+  else bad "chip 缺 data-type，六种 type 会全部退回默认色"; fi
+
+  if grep -q '<ul class="preview">' "$home"; then ok "清单卡把列表项铺了出来"
+  else bad "清单卡没有铺出列表项——只给标题的话，一张清单和一条短记在屏幕上一样重"; fi
+
+  if grep -q '<span class="host">github.com</span>' "$home"; then ok "外链卡显示目标域名"
+  else bad "外链卡没显示域名——「这条链接通向哪」是外链最重要的一条信息"; fi
+
+  # 清单卡里铺出来的预览项也是 <li>，但没有 data-type。筛选脚本要是抓所有 li，
+  # 一按「清单」这些预览项会因为「type 不匹配」被整排隐藏，卡片只剩一个孤零零的标题。
+  if grep -q "querySelectorAll<HTMLElement>(':scope > li')\|querySelectorAll(':scope > li')" web/src/pages/index.astro; then
+    ok "筛选只抓顶层 li（清单卡的预览项不会被连坐隐藏）"
+  else
+    bad "筛选抓了所有 li —— 按类型筛选会把清单卡自己的预览项一起隐藏"
+  fi
+else
+  bad "清单/外链条目让构建失败了"
+fi
+rm -f "$ENTRIES/$T-list.md" "$ENTRIES/$T-link.md"
+
+# ── 9. 卡片渲染的边界：不能产出没有任何文字、却整片可点的卡 ────────────────
+# excerpt 会剥掉代码块和表格。正文「全是被剥掉的东西」时它返回空串，
+# 碎片卡的标题就整个是空的——屏幕阅读器读到一个没有名字的链接。
+entry "$T-tableonly" '---
+type: log
+visibility: public
+created: 2026-01-03
+---
+
+| 页面 | 对每个访客一样吗 |
+|---|---|
+| 首页 | 是 |'
+entry "$T-tablefirst" '---
+type: note
+visibility: public
+created: 2026-01-04
+---
+
+| 层 | 走哪条 |
+|---|---|
+| public | 静态 |
+
+TABLEFIRST_BODY 表格后面这段才是正文。'
+if build >/dev/null; then
+  if grep -qE "<a class=\"t\" href=\"/e/$T-tableonly/\">\s*</a>" web/dist/index.html; then
+    bad "纯表格条目渲染出了空标题的可点卡片"
+  else
+    ok "纯表格条目仍有标题（不会出现无名可点卡）"
+  fi
+  h1=$(grep -o "<h1>[^<]*</h1>" "web/dist/e/$T-tablefirst/index.html" 2>/dev/null | head -1)
+  if [ "$h1" = "<h1>（无题）</h1>" ]; then
+    bad "正文以表格开头 → 标题退回「（无题）」，而下一段明明有正文"
+  else
+    ok "正文以表格开头时，标题取的是后面那段真正文"
+  fi
+else
+  bad "含表格的条目让构建失败了"
+fi
+rm -f "$ENTRIES/$T-tableonly.md" "$ENTRIES/$T-tablefirst.md"
+
+# ── 10. 清单卡只铺顶层项、外链卡指向真正的目标 ──────────────────────────────
+entry "$T-nested" '---
+title: 有子项的清单
+type: list
+visibility: public
+created: 2026-01-05
+---
+
+- 顶层甲
+  - NESTED_CHILD 子项不该被铺出来
+- 顶层乙'
+entry "$T-imglink" '---
+type: link
+visibility: public
+created: 2026-01-06
+---
+
+![截图](https://cdn.example-shot.test/s.png)
+
+[真正的目标](https://real-target.test/a)'
+if build >/dev/null; then
+  if grep -q "NESTED_CHILD" web/dist/index.html; then
+    bad "清单卡把缩进的子项当顶层项铺了出来（还会挤占名额、让「还有 N 条」算错）"
+  else
+    ok "清单卡只铺顶层项，子项不平铺"
+  fi
+  if grep -q '"host">cdn.example-shot.test<' web/dist/index.html; then
+    bad "外链卡显示的是配图的图床域名，不是这条链接真正指向的地方"
+  elif grep -q '"host">real-target.test<' web/dist/index.html; then
+    ok "外链卡指向真正的目标，不被正文配图带偏"
+  else
+    bad "外链卡没显示域名"
+  fi
+else
+  bad "清单/外链边界条目让构建失败了"
+fi
+rm -f "$ENTRIES/$T-nested.md" "$ENTRIES/$T-imglink.md"
+
+# ── 11. 版式的两条结构性约束（源码断言，产物里看不出来） ───────────────────
+# grid 轨道的 base size 是 item 的 min-content，而 body 的 overflow-wrap 只管换行、
+# 不改 min-content。少了这条下限，正文里一条长 URL 就能把整条轨道撑破视口——
+# 实测 200% 字号下 375px 视口横向滚动，违反 WCAG 1.4.4 / 1.4.10。
+if grep -q "grid-template-columns: minmax(0, 1fr)" web/src/styles/global.css; then
+  ok "时间流的 grid 轨道有 0 下限（长 URL 不会撑破视口）"
+else
+  bad "grid 轨道缺 minmax(0,1fr)，长 URL 会在放大字号时撑出横向滚动"
+fi
+# UA 的 [hidden]{display:none} 属于 user-agent origin，作者样式里的 display:flex 会赢它。
+if grep -q "\.filters\[hidden\] { display: none; }" web/src/styles/global.css; then
+  ok "筛选条的 hidden 真的生效（JS 失效时不显示死按钮）"
+else
+  bad "\.filters 的 display:flex 盖掉了 hidden，无 JS 时按钮显示但点不动"
+fi
+# 播报的数字是屏幕阅读器用户按下筛选钮后唯一的反馈，肉眼验收发现不了它错。
+if grep -q "querySelectorAll(':scope > li:not(\[hidden\])')" web/src/pages/index.astro; then
+  ok "筛选播报只数顶层卡（不把清单卡的预览项算进去）"
+else
+  bad "筛选播报把清单卡的预览项也数进去了，读屏器听到的条数是错的"
+fi
+
+# ── 12. 构建失败时不能把已发布的产物留在半截状态 ──────────────────────────────
 # scripts/publish 存在的理由：astro build 会先清空 outDir，而 outDir 就是线上 docroot。
-entry zz-breaks-build '---
+entry "$T-breaks-build" '---
 type: log
 visibility: unlisted
 created: 2026-01-01
@@ -249,7 +403,7 @@ if leaks ZZ_BREAKS_BUILD; then
 else
   ok "失败构建的正文没有进 web/dist"
 fi
-rm -f "$ENTRIES/zz-breaks-build.md"
+rm -f "$ENTRIES/$T-breaks-build.md"
 
 echo
 if [ "$fails" -eq 0 ]; then

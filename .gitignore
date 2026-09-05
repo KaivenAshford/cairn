@@ -12,6 +12,14 @@ data/
 # 代码仓里只有 web/content/fixtures/ 那几条示例，用 scripts/seed 放进来。
 web/content/entries/
 
+# 调查记录：过程产物，几百 KB 的 HTML 和 JSON。
+# 结论已经落进代码、CLAUDE.md 的硬约束和 ARCHITECTURE.md 的理由段落，
+# 这里留的是「怎么得出来的」，本地看就够，不必进仓库。
+audit/
+
+# 系统
+.DS_Store
+
 # 环境
 .env
 *.local

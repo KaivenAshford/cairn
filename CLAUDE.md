@@ -37,45 +37,61 @@
   (已 gitignore);代码仓里只有 `web/content/fixtures/` 那几条示例,`scripts/seed` 灌进去。
   好处是消灭了唯一一类不可逆的泄露(私密条目进 git 历史改不掉),代价是「谁进构建产物」
   从目录分离(硬)变成了字段过滤(软),必须靠 `scripts/test-visibility` 钉住。
+- **卡片按 type 分叉是设计的前提,不是装饰。** chip 的 `data-type` 少了,六种颜色全部
+  退回默认色,整版设计只剩白卡;清单卡不铺项、外链卡不显示域名的话,一张「在读」和
+  一条随手记在屏幕上一样重。这几条都由 `scripts/test-visibility` 钉着。
 - **纯私密日记不上网。** 站上只放「至少愿意给一个人看」的东西。
 - 未实现的东西一律拒绝请求(现在 `/circle/*` 返回 501),绝不为了「先跑起来」而放行。
 
 ## 当前状态(2026-09-05)
 
-**基础(博客那一半)已经做扎实,并且有跑得起来的回归测试。** 其余部分一律停在原地等审核。
+**基础(博客那一半)做扎实了,视觉也重做过一轮。** 其余部分一律停在原地等审核。
 
 **内容与代码已分仓**:真实条目在单独的 private 仓库(clone 到 `web/content/entries/`),
 代码仓里只有 `web/content/fixtures/` 那 3 条示例。服务端因此只有一个内容目录,
 可见度纯由 frontmatter 决定。详见 ARCHITECTURE.md 第 2 节。
 
-`server/`(Go,零依赖)`gofmt` / `go vet` / `go test -race` 全过,20 个测试。
-`web/`(Astro 5)`astro check` 0 errors,`scripts/test-visibility` 15 条性质全过。
+**视觉是「六色卡纸」**:卡片式时间流,六种 type 各一支色相(OKLCH 同明度带上取,
+锁死明度只转色相,六个色块份量才一样重),每张卡是自己那支淡色底 + 顶端渐变色条 +
+实心 chip。而且卡片**按 type 长得不一样**——长文最大、短记是一句话、外链带域名、
+清单直接铺前几项。这一版之前有过五个方案,选它的过程记在 `audit/`。
+
+`server/`(Go,零依赖)`gofmt` / `go vet` / `go test -race` 全过,26 个测试。
+`web/`(Astro 5)`astro check` 0 errors,`scripts/test-visibility` 26 条性质全过。
 两套测试都做过变异验证(把修复改坏,确认测试真的会失败),不是摆设。
 
 **这一轮修掉的真问题**(每条都有对应测试兜住):
 
 | 问题 | 后果 |
 |---|---|
-| `os.Stat` + `os.Rename` 的 TOCTOU | 12 路并发同标题 → 9 个 201 但磁盘只剩 1 个文件,8 条静默丢失 |
-| `yamlString` 不转义 C0 字符 | 粘一段带 ANSI 码的标题 → 落盘成功 → 下次构建 YAML 解析失败 → 线上站被清空 |
-| `findEntry` 丢掉 `parseFrontmatter` 的 ok | 更新一条 CRLF/BOM 行尾的公开条目 → 200,但 title/type/created 全被抹掉、掉回 private |
-| 显式 id 绕过 unlisted 随机名 | `n -i salary -v unlisted` 回 201 + 一个永不存在的 URL,而整站从此构建不出来 |
-| upsert 读-改-写无串行化 | 并发时「收回成 private」被另一条沿用旧值的编辑写回 public |
-| `formatDate` 用本地时区 | UTC 以西的机器上每一条都显示成前一天,而 `<time datetime>` 是对的 |
-| `astro build` 直接写 docroot | 构建失败先清空产物,还留下含全部条目正文的中间 chunk |
-| 容器 uid 与 bind mount 属主不符 | 按 `deploy/` 起容器,写入通道对每条都返回 500 |
-| unlisted 守卫锚定整个 id | 按目录归档的 unlisted(`2026/<随机>`)必然构建失败 |
-| `stripMarkdown` 先剥反引号 | `` `CAIRN_CONTENT_DIR` `` 在首页和 meta description 里变成 `CAIRNCONTENTDIR` |
-| `excerpt` 用正则配对围栏 | 未闭合的代码块整段漏进摘要,连 ``` 标记都在 |
-| `excerpt` 剥 frontmatter | 死代码,且正文以 `---` 开头时会吃掉第一段 |
+| `os.Stat` + `os.Rename` 的 TOCTOU | 12 路并发同标题 → 9 个 201 但磁盘只剩 1 个文件 |
+| `yamlString` 不转义 C0 字符 | 带 ANSI 码的标题 → 落盘成功 → 下次构建整站挂 |
+| `findEntry` 丢掉 `parseFrontmatter` 的 ok | 更新 CRLF/BOM 行尾的公开条目 → 200 但字段全被抹掉、掉回 private |
+| 显式 id 绕过 unlisted 随机名 | 回 201 + 一个永不存在的 URL,而整站从此构建不出来 |
+| upsert 读-改-写无串行化 | 并发时「收回成 private」被沿用旧值的编辑写回 public |
+| `formatDate` 用本地时区 | UTC 以西每一条都显示成前一天 |
+| `astro build` 直写 docroot | 构建失败先清空产物,还留下含全部正文的中间 chunk |
+| 容器 uid 与 mount 属主不符 | 按 `deploy/` 起容器,写入通道每条都 500 |
+| `.stream` 的 grid 轨道没有 0 下限 | 一条长 URL 撑破视口,200% 字号下横向滚动(WCAG 1.4.4) |
+| 碎片卡标题可能整个为空 | 纯表格/纯代码块的条目 → 一张没有任何文字、却整片可点的卡 |
+| `displayTitle` 只看正文首行 | 正文以表格开头 → 标题退回「（无题）」,而下一段明明有正文 |
+| `listItems` 放行缩进子项 | 子项被当顶层铺出来,还挤占名额让「还有 N 条」算错 |
+| `linkHost` 没排除图片语法 | 外链卡显示的是配图的图床域名,不是链接真正指向的地方 |
+| 筛选脚本抓所有 `li` | 按类型筛选会把清单卡自己的预览项一起隐藏 |
+| 用 `opacity` 表达弱化 | 它会乘到前景色上,两处因此掉到 AA 以下(3.57 / 3.96) |
+| `test-visibility` 无条件覆盖 fixture | **会静默删掉内容目录里的同名真实条目**,而那个目录不进代码仓的 git |
 
 **新增能力**:写入通道支持按 id 更新(`n -i now "..."`),保留 `created`、写 `updated`、
-继承没提供的字段。`/now` 这类单页终于能不开编辑器就改。
+继承没提供的字段。
 
 **未实现,且需要先过审再做**:`/circle/*` 的会话与渲染、magic link、`pipeline/` 的数据采集、
 算力接口、手机端写入入口、写入后自动重建、CI。
 
-**仓库还没有第一个 commit。**
+**还欠两处**(都在 `audit/` 的验证报告里):
+1. `photo` 是六型里唯一拿到了颜色却没有结构分支的——影像卡上从不出现图像。
+   要么做图片支持,要么把注释改成「四种有分支」。
+2. 暗色代码块的注释色只有 3.05:1(github-dark 自带),改 CSS 修不掉,
+   要换成 `*-high-contrast` 主题,代价是配色变艳一点。
 
 ## 下一步(按这个顺序)
 

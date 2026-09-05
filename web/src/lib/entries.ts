@@ -57,6 +57,9 @@ export async function unlistedEntries(): Promise<Entry[]> {
 function stripMarkdown(line: string): string {
   const t = line.trim();
   if (/^([-*_])\1{2,}$/.test(t)) return ''; // --- *** ___ 是分隔线，不是内容
+  // 表格行整行丢掉。它的内容离开了行列关系就是一串没有主谓的词，
+  // 出现在卡片摘要或 meta description 里只会是「| 页面 | 对每个访客一样吗 |」。
+  if (t.startsWith('|')) return '';
   return t
     .replace(/^(?:[#>]+|[-*+]|\d+[.)])\s+/, '') // 行首的标题 / 引用 / 列表标记
     .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1') // 链接与图片：留下文字
@@ -78,13 +81,19 @@ function stripMarkdown(line: string): string {
 /** log / link 这类碎片可以没标题，用正文首行兜底。 */
 export function displayTitle(entry: Entry): string {
   if (entry.data.title) return entry.data.title;
-  // 跳过代码围栏和分隔线：它们是标记不是内容，拿来当标题只会得到「```」或者「（无题）」。
-  const line =
-    (entry.body ?? '').split('\n').find((l) => {
-      const t = l.trim();
-      return t.length > 0 && !t.startsWith('```') && !/^([-*_])\1{2,}$/.test(t);
-    }) ?? '';
-  const stripped = stripMarkdown(line);
+  // 找第一行**剥完还剩字**的，而不是第一行原文非空的。
+  // 代码围栏、分隔线、表格行剥完都是空串——只看原文的话，正文以表格开头的条目
+  // 标题会退回「（无题）」，而同一页的 meta description 里明明有下一段正文。
+  let stripped = '';
+  for (const l of (entry.body ?? '').split('\n')) {
+    const t = l.trim();
+    if (!t || t.startsWith('```')) continue;
+    const s = stripMarkdown(l);
+    if (s) {
+      stripped = s;
+      break;
+    }
+  }
   return stripped.length > 60 ? stripped.slice(0, 60) + '…' : stripped || '（无题）';
 }
 
@@ -119,6 +128,59 @@ export function excerpt(entry: Entry, max = 96): string {
     .replace(/\s+/g, ' ')
     .trim();
   return text.length > max ? text.slice(0, max) + '…' : text;
+}
+
+/**
+ * list 条目的前几项，直接铺在时间流的卡片上。
+ *
+ * 清单的信息全在项里，标题只是个文件名——只给标题的话，一张「这个季度在读」的卡
+ * 和一条短记在屏幕上一样重，读者没有任何理由点进去。
+ * 只认顶层列表项：缩进的子项依附上一条，单独抽出来会丢掉上下文。
+ */
+export function listItems(entry: Entry): string[] {
+  const out: string[] = [];
+  let inCode = false;
+  for (const raw of (entry.body ?? '').split('\n')) {
+    if (raw.trim().startsWith('```')) {
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode) continue;
+    // 顶层就是顶层，不留缩进余量。CommonMark 允许顶层项带 0~3 个空格，
+    // 但这个站的正文（手写的和 scripts/n 写的）都从第 0 列起；而 2 空格恰好是
+    // 多数编辑器缩进子项的量，放行它等于把子项当顶层铺出来——正是上面注释要避免的。
+    if (!/^(?:[-*+]|\d+[.)])\s+/.test(raw)) continue;
+    const text = stripMarkdown(raw);
+    if (text) out.push(text);
+  }
+  return out;
+}
+
+/**
+ * link 条目指向的域名，显示在卡片上。
+ *
+ * 「这条链接通向哪」是外链最重要的一条信息，而它现在藏在正文的 markdown 语法里。
+ * 解析失败就返回 null，卡片少一行而已——不为一个装饰性的字段让构建挂掉。
+ */
+export function linkHost(entry: Entry): string | null {
+  const body = entry.body ?? '';
+  // 图片语法 ![alt](url) 也以 `](` 结尾，所以要连 `[` 前面那个 ! 一起看——
+  // 否则正文里配了图的外链，卡片上显示的会是图床域名。
+  // 「这条链接通向哪」正是这个字段存在的唯一理由，指错地方比不显示更糟。
+  let url = body.match(/(?<!!)\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/)?.[1] ?? null;
+  if (!url) {
+    for (const g of body.matchAll(/(https?:\/\/[^\s)<>"']+)/g)) {
+      if (/!\[[^\]]*\]\($/.test(body.slice(0, g.index))) continue;
+      url = g[1];
+      break;
+    }
+  }
+  if (!url) return null;
+  try {
+    return new URL(url).host.replace(/^www\./, '');
+  } catch {
+    return null;
+  }
 }
 
 export const TYPE_LABEL: Record<string, string> = {

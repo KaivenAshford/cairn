@@ -1,9 +1,17 @@
 ---
 import Base from '../layouts/Base.astro';
-import { publicEntries, displayTitle, excerpt, formatDate, TYPE_LABEL } from '../lib/entries';
+import {
+  publicEntries, displayTitle, excerpt, formatDate, listItems, linkHost, TYPE_LABEL,
+} from '../lib/entries';
 
 const entries = await publicEntries();
 const types = [...new Set(entries.map((e) => e.data.type))];
+
+// done 不显示：「写完了」是默认期待，标出来只是噪音。会说话的只有「还没写完」。
+const STATUS_LABEL: Record<string, string> = { seed: '种子', growing: '生长中' };
+
+// 清单卡最多铺几项。再多就从「预览」变成「把内容搬到首页」，条目页就没意义了。
+const PREVIEW = 4;
 ---
 
 <Base description="一个人的可浏览版本。">
@@ -15,23 +23,58 @@ const types = [...new Set(entries.map((e) => e.data.type))];
   )}
 
   <ul class="stream" id="stream">
-    {entries.map((e, i) => (
-      <li data-type={e.data.type} data-lead={i === 0 ? '' : undefined}>
-        <div class="meta">
-          <span class="chip">{TYPE_LABEL[e.data.type] ?? e.data.type}</span>
-          <time datetime={e.data.created.toISOString()}>{formatDate(e.data.created)}</time>
-          {e.data.status === 'seed' && <span class="seed">· 种子</span>}
-        </div>
-        <a class="title" href={`/e/${e.id}/`}>{displayTitle(e)}</a>
-        {e.data.type !== 'post' && <p class="excerpt">{excerpt(e)}</p>}
-      </li>
-    ))}
+    {entries.map((e) => {
+      const type = e.data.type;
+      const status = e.data.status;
+      // 六种 type 共用一张卡的话，一句话的短记和一篇长文在屏幕上一样重。
+      // 所以卡片的结构本身按 type 分叉：长文有摘要和「读全文」，短记只有正文，
+      // 清单铺前几项，外链亮出域名。
+      const items = type === 'list' ? listItems(e) : [];
+      const host = type === 'link' ? linkHost(e) : null;
+      // 碎片 = 短记，或者任何没写标题的条目。没标题时 displayTitle 拿的就是正文首行，
+      // 再配一段以同一句话开头的摘要，等于把同一行字印两遍——那是这版之前首页最难看的地方。
+      const fragment = type === 'log' || !e.data.title;
+      const hasExcerpt = !fragment && !(type === 'list' && items.length > 0);
+      return (
+        <li class="card" data-type={type} data-fragment={fragment ? '' : undefined}>
+          <div class="card-head">
+            <span class="chip" data-type={type}>{TYPE_LABEL[type] ?? type}</span>
+            <time class="date" datetime={e.data.created.toISOString()}>{formatDate(e.data.created)}</time>
+            {status && STATUS_LABEL[status] && (
+              <span class="status" data-status={status}>{STATUS_LABEL[status]}</span>
+            )}
+          </div>
+
+          {/* 碎片没有标题栏，正文本身就是标题——它本来就只有一句话，
+              再给它挤一个「（无题）」式的标题只会让它看起来像一篇没写完的文章。 */}
+          {/* 碎片走 excerpt，但它可能返回空串：正文只有代码块或表格时，
+              该剥的都剥完就什么都不剩了。displayTitle 内部有「（无题）」兜底，
+              所以退回它 —— 一张没有任何文字、却整片可点的卡是最糟的结果。 */}
+          <a class="t" href={`/e/${e.id}/`}>
+            {(fragment && excerpt(e, 120)) || displayTitle(e)}
+          </a>
+
+          {items.length > 0 && (
+            <ul class="preview">
+              {items.slice(0, PREVIEW).map((it) => <li>{it}</li>)}
+              {items.length > PREVIEW && <li class="rest">还有 {items.length - PREVIEW} 条</li>}
+            </ul>
+          )}
+
+          {hasExcerpt && excerpt(e, type === 'post' ? 120 : 90) &&
+            <p class="excerpt">{excerpt(e, type === 'post' ? 120 : 90)}</p>}
+
+          {host && <span class="host">{host}</span>}
+          {type === 'post' && <span class="more">读全文 →</span>}
+        </li>
+      );
+    })}
   </ul>
 
   <p class="sr-only" id="filter-status" role="status" aria-live="polite"></p>
 
   {entries.length === 0 && (
-    <p style="color: var(--muted)">
+    <p class="empty">
       还没有公开条目。往 <code>web/content/entries/</code> 里放一个 markdown,
       或者打通写入通道让 <code>server</code> 帮你放。
     </p>
@@ -55,17 +98,19 @@ const types = [...new Set(entries.map((e) => e.data.type))];
       b.setAttribute('aria-pressed', String(b === btn)),
     );
 
-    let lead: HTMLElement | null = null;
-    stream.querySelectorAll<HTMLElement>('li').forEach((li) => {
+    // 卡片之间靠间距分开，不再靠分隔线，所以筛掉第一条也不会留下一条悬空的线——
+    // 原先那套 data-lead 的补偿逻辑跟着分隔线一起去掉了。
+    // :scope > li 是必须的：清单卡里铺的前几项也是 <li>，但它们没有 data-type，
+    // 不加这层限定的话，一按「清单」筛选，被筛出来的清单卡自己的预览项会因为
+    // 「dataset.type 不等于 list」被整排隐藏——卡片只剩一个孤零零的标题。
+    stream.querySelectorAll<HTMLElement>(':scope > li').forEach((li) => {
       li.hidden = want !== 'all' && li.dataset.type !== want;
-      // 分隔线画在 li 的上边，筛掉第一条之后可见的首条会多出一条线。
-      li.removeAttribute('data-lead');
-      if (!li.hidden && !lead) lead = li;
     });
-    (lead as HTMLElement | null)?.setAttribute('data-lead', '');
 
     if (status) {
-      const n = stream.querySelectorAll('li:not([hidden])').length;
+      // 同样要限定层级：清单卡的预览项从不被设 hidden，不限定的话它们恒被计入，
+      // 而这个数字是屏幕阅读器用户按下筛选钮后唯一的反馈。
+      const n = stream.querySelectorAll(':scope > li:not([hidden])').length;
       status.textContent = `${btn.textContent}:${n} 条`;
     }
   });

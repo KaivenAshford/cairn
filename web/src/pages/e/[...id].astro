@@ -13,10 +13,13 @@ const { Content } = await render(entry);
 ---
 
 <Base title={displayTitle(entry)} description={excerpt(entry, 140)}>
-  <article class="entry">
+  {/* data-type 是这一版唯一新增的 markup：条目页的顶端色条、淡底、h3 着色、引用竖线
+      全部从 :root 里那张「type → 颜色」映射表取值，靠的就是这个属性。少了它，
+      从时间流点进来颜色会突然消失，「同一个东西打开了」这层连续性就断了。 */}
+  <article class="entry" data-type={entry.data.type}>
     <h1>{displayTitle(entry)}</h1>
     <div class="meta">
-      <span class="chip">{TYPE_LABEL[entry.data.type] ?? entry.data.type}</span>
+      <span class="chip" data-type={entry.data.type}>{TYPE_LABEL[entry.data.type] ?? entry.data.type}</span>
       {' '}<time datetime={entry.data.created.toISOString()}>{formatDate(entry.data.created)}</time>
       {entry.data.updated && <> · 更新于 {formatDate(entry.data.updated)}</>}
       {entry.data.status === 'seed' && <> · <span class="seed">种子，还没想清楚</span></>}

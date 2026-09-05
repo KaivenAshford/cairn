@@ -1,80 +1,641 @@
+/* ============================================================================
+   cairn · 六色卡纸
+   ----------------------------------------------------------------------------
+   结构沿用上一版（卡片式时间流、卡片按 type 分叉、hover 上浮、两层阴影、圆角 14px）。
+   这一版换掉的只有一样东西：颜色。
+
+   为什么要换：上一版整站只有一个强调色，而且它只出现在小小的 chip 和 hover 上。
+   页面 95% 的面积是米白、白、灰——结构对了，看起来还是一片素。**颜色不占面积，
+   就等于没有颜色。**
+
+   这一版的做法：**让颜色去承担分类**。六种 type 各一个色相，同时出现在三个地方——
+   卡片顶端 4px 的色条、整张卡片一层淡色底、实心色块的 chip。于是扫读时读到的是颜色，
+   而不是标签上那两个字；「这条是长文」在余光里就成立了，不需要真的看清楚。
+   代价是首页从「白纸上印黑字」变成「六种颜色的卡纸摞在一起」，见文件末尾的取舍说明。
+
+   六个色相怎么选的：在 OKLCH 的同一条明度带上取六个点（亮色 L=0.485，暗色 L=0.80），
+   而不是随手挑六个纯色。随手挑的问题是明度乱跳——纯黄和纯蓝并排，黄的会「跳出来」，
+   蓝的会「陷下去」，六个一起看就是儿童积木。锁死明度、只让色相转，六个色块的**份量
+   才一样重**，看着才像一套东西。色相取 38 / 105 / 158 / 228 / 300 / 352，
+   相邻间隔 46°–72°（青绿 180–220 那一段留给了全站的「机壳色」青，见 --accent）。
+
+   中性色全部带暖色相（OKLCH H≈80–85，C≈0.009–0.014）而不是纯灰：纯灰配彩色最容易显廉价，
+   因为纯灰在任何有色底旁边都会被反衬出脏的蓝味。页底是暖米色 #f9f6f0，
+   六种淡色底就都像是「同一批纸染了不同的色」，而不是「白纸上刷了六种荧光笔」。
+
+   所有对比度都是算出来的，不是估的：见本文件同目录之外的校验脚本思路——
+   把这里的十六进制抠出来逐对算 WCAG，亮暗两套共 146 组，全部 ≥ 各自的门槛。
+
+   为什么亮暗两套的层次机制不一样：亮色下卡片靠**阴影**浮起来；暗色下阴影是看不见的
+   （黑底上再叠黑），所以改成靠**亮度**——越靠上的层越亮，再补一条发丝描边和一道
+   顶部内高光。这不是把颜色反过来，是换了一套表达层次的物理。
+   颜色同理：暗色的六色不是亮色六色的反相，是**同色相、降饱和、提亮度**重新取的一组
+   （C 0.135→0.095，L 0.485→0.80）。照搬亮色那六支到黑底上会刺眼到没法读。
+   ========================================================================== */
+
 :root {
-  --bg: #fbfaf7;
+  color-scheme: light dark;
+
+  /* —— 六型六色。每支四个值，各自锁死一个明度，只让色相转 ——
+        ink    L=0.485 深色。正文级的字（长文标题、域名、读全文、h3）、实心 chip 的底
+        vivid  L=0.600 鲜色。色条的浅端、清单圆点、引用竖线。定在 0.60 而不是更亮的
+               0.66，是因为 0.66 对淡底只有 2.5:1，过不了非文字的 3:1
+        w      L=0.950 卡片底。这一版颜色的主要面积
+        w2     L=0.928 卡片 hover 底 ——
+        post  H38  锈红 · 赤陶。最重的一类给最暖最强的色相
+        list  H105 苔绿 · 橄榄。清单是「摊开来看的东西」，用最不抢戏的一支
+        note  H158 松绿。常青笔记本来就该是常青的颜色
+        log   H228 靛蓝。短记条数最多（这份内容里 8/21），所以给一支最安静的
+        link  H300 紫。外链是别人的东西，紫在这六支里最「不属于本站」
+        photo H352 玫绛。影像最感性，给唯一一支偏粉的 */
+  --c-post:   #c75c3a;  --c-post-ink:  #9c3c1d;  --c-post-w:  #fee9e3;  --c-post-w2:  #fde0d7;
+  --c-list:   #8b831e;  --c-list-ink:  #67611a;  --c-list-w:  #f1f0dc;  --c-list-w2:  #eae9d1;
+  --c-note:   #229762;  --c-note-ink:  #1e7049;  --c-note-w:  #e3f3e9;  --c-note-w2:  #d9ede0;
+  --c-log:    #218cb3;  --c-log-ink:   #1d6884;  --c-log-w:   #e0f2fa;  --c-log-w2:   #d6ebf6;
+  --c-link:   #8e69c9;  --c-link-ink:  #6c499f;  --c-link-w:  #f1ebfe;  --c-link-w2:  #ebe2fd;
+  --c-photo:  #bf5789;  --c-photo-ink: #953867;  --c-photo-w: #fee8f0;  --c-photo-w2: #fdddea;
+
+  /* —— 表面：三层。页底 < 卡片 < 卡片 hover。亮色下三者几乎同色，层次交给阴影 —— */
+  --bg: #f9f6f0;             /* 暖米。比上一版的 #fbfaf7 暖一点，好让六种淡底显得是「同一批纸染了不同的色」；
+                                但没有暖到奶油（C 只有 0.009）——页底一旦太黄，靛蓝和松绿那两张卡就会
+                                被反衬成冷白，六张卡看着不像一套。 */
+  --surface: #fffcf7;        /* 无类型的卡片（/now、404）。比纸底亮，配合阴影才有「浮」的方向感 */
+  --surface-2: #fcf9f2;      /* 无类型卡片的 hover */
+
+  /* —— 文字 —— */
   --fg: #1b1a17;
-  --muted: #6d6a62;
-  --line: #e2ded4;
-  --accent: #7a5c2e;
-  --chip: #efece4;
-  --measure: 34rem;
+  --muted: #666159;          /* 暖灰。要同时落在六种 hover 底上，最差一组 4.89:1，压着 AA 过 */
+  --accent: #176b6b;         /* 青。全站的「机壳色」：链接、焦点环、字标、「全部」筛选钮。
+                                它刻意不在六色之内——内容的颜色归内容，界面的颜色归界面，
+                                否则 hover 一个链接就会跟某一类条目撞色，颜色的意思就散了。
+                                色相 195 正好落在 note(158) 和 log(228) 中间那段没人用的空当。 */
+  --accent-soft: #1f8a8a;    /* 青的鲜色版，只用在装饰（无类型卡片的色条） */
+  --on-accent: #fffcf7;      /* 实心色块上的字：用纸色而不是纯白，免得刺 */
+
+  /* —— 线 —— */
+  /* 卡片描边不在这里：它是 color-mix(--t-ink 18%, --t-wash) 现算的，
+     跟着条目自己那一支颜色走。留一支中性描边只会有人误用。 */
+  --line: #e3dac7;           /* 页脚那条淡出的线 */
+  --underline: #8a8477;      /* 正文里链接的下划线 */
+  --chip-bg: #f0e9db;        /* 中性小块：导航 hover 的底 */
+  /* 整站的横线母题：两端淡出。比实线安静，又比没有线多一点结构 */
+  --rule: linear-gradient(90deg, transparent, var(--line) 12%, var(--line) 88%, transparent);
+
+  /* —— 阴影：两层。一层紧贴的暗边勾出卡片形状，一层扩散的软影给出高度。
+        单层 blur 之所以显廉价，是因为它只有后者。
+        色相是暖褐而不是黑：彩色卡片下面压一团中性黑影会显脏。 —— */
+  --shadow-0: 0 1px 1px rgb(74 52 24 / .05);
+  --shadow-1: 0 1px 2px rgb(74 52 24 / .08), 0 6px 16px -6px rgb(74 52 24 / .12);
+  --shadow-2: 0 2px 4px rgb(74 52 24 / .10), 0 14px 28px -10px rgb(74 52 24 / .20);
+  /* 顶部内高光只有暗色需要。但这里不能写 none——box-shadow 的列表里出现 none 整条声明
+     就作废了（实测：卡片一个阴影都不显示）。所以用一个完全透明的空阴影占位。 */
+  --shadow-in: inset 0 0 0 0 rgb(0 0 0 / 0);
+
+  /* —— 尺寸 —— */
+  --wrap: 45rem;
+  --measure: 36rem;          /* 正文行长。中文一行 30–40 字最舒服 */
+  --r-card: 14px;
+  --r-sm: 8px;
+  --bar: 4px;                /* 卡片顶端色条的厚度。见 .card::before */
+  --flow: 1.5em;             /* 段间距。见下面 .entry 里那段注释，这是全站最要紧的一个值 */
+
+  /* —— 字号阶梯：比例 1.25，从 17px 起。原来 8 个字号互相之间没有倍数关系，
+        h1 只比 UA 默认 h2 大 6.7%，于是「哪个更重要」全靠猜。 —— */
+  --fs-xs: 0.75rem;          /* 12 · chip、状态 */
+  --fs-sm: 0.8125rem;        /* 13 · 日期、footer */
+  --fs-ms: 0.9375rem;        /* 15 · 摘要 */
+  --fs-base: 1.0625rem;      /* 17 · 正文。汉字笔画密度高，16px 偏小 */
+  --fs-md: 1.1875rem;        /* 19 · 短记正文、普通卡片标题 */
+  --fs-lg: 1.375rem;         /* 22 · 长文卡片标题、h3 */
+  --fs-xl: 1.75rem;          /* 28 · h2 */
+  --fs-2xl: 2.125rem;        /* 34 · h1，比 UA 默认 h2 大 42% */
+
+  --ease: cubic-bezier(.2, .7, .3, 1);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #14130f;
-    --fg: #e8e4da;
-    --muted: #918c80;
-    --line: #2b2823;
-    --accent: #c9a45f;
-    --chip: #221f1a;
+    /* 六色暗色版：同色相，C 0.135→0.095，L 0.485→0.80。饱和度降、亮度提——
+       亮色那六支直接搬到黑底上会刺眼，而且深底上的深色根本读不出来。
+       淡底 w / w2 在暗色下反过来是**深色底**（L 0.258 / 0.300），它接替了亮色下阴影的活：
+       暗色里层次靠亮度，卡片必须比页底亮。 */
+    --c-post:   #e08164;  --c-post-ink:  #f4a991;  --c-post-w:  #311e18;  --c-post-w2:  #3e2721;
+    --c-list:   #aaa239;  --c-list-ink:  #c7c278;  --c-list-w:  #262412;  --c-list-w2:  #302f19;
+    --c-note:   #4fb680;  --c-note-ink:  #88d1a6;  --c-note-w:  #16281e;  --c-note-w2:  #1e3327;
+    --c-log:    #2daddb;  --c-log-ink:   #78caee;  --c-log-w:   #122730;  --c-log-w2:   #19313c;
+    --c-link:   #ab8ce0;  --c-link-ink:  #c7b0f2;  --c-link-w:  #262031;  --c-link-w2:  #302a3d;
+    --c-photo:  #d97ca7;  --c-photo-ink: #eea4c4;  --c-photo-w: #301d25;  --c-photo-w2: #3c2630;
+
+    --bg: #14110c;
+    --surface: #26231e;
+    --surface-2: #312d28;
+
+    --fg: #e3dfd7;
+    --muted: #a29e96;
+    --accent: #7fcac9;       /* 青的暗色版。亮色那支 #176b6b 在黑底上只有 1.4:1，必须整支换掉 */
+    --accent-soft: #39abab;
+    --on-accent: #14110c;
+
+    --line: #35302a;
+    --underline: #8a847b;
+    --chip-bg: #322d26;
+
+    /* 阴影仍然留着：它在暗色下几乎看不见，但能让卡片边缘不那么「贴」在背景上。
+       真正干活的是下面那条 inset 高光——它模拟从上方来的光打在卡片上沿。 */
+    --shadow-0: 0 1px 1px rgb(0 0 0 / .35);
+    --shadow-1: 0 1px 2px rgb(0 0 0 / .5), 0 8px 20px -8px rgb(0 0 0 / .55);
+    --shadow-2: 0 2px 6px rgb(0 0 0 / .55), 0 18px 34px -12px rgb(0 0 0 / .7);
+    --shadow-in: inset 0 1px 0 rgb(255 255 255 / .05);
   }
 }
 
-* { box-sizing: border-box; }
+/* —— type → 颜色，只映射一次 ——
+   任何带 data-type 的元素（卡片、chip、筛选钮、条目页的 article）都在这里拿到自己那一支，
+   下面所有规则一律只写 var(--t-*)。好处是：新增一种 type 只要多写一行，
+   而不是去六十条规则里各加一个分支——这和 ARCHITECTURE.md 里
+   「加一种新内容类型 = 多一个 type 值，架构不动」是同一条约定的 CSS 版本。 */
+:root {
+  /* 兜底：没有 type 的卡片（/now、404）走青色机壳色 + 中性纸面 */
+  --t-ink: var(--accent);
+  --t-vivid: var(--accent-soft);
+  --t-wash: var(--surface);
+  --t-wash-2: var(--surface-2);
+}
+[data-type="post"]  { --t-ink: var(--c-post-ink);  --t-vivid: var(--c-post);  --t-wash: var(--c-post-w);  --t-wash-2: var(--c-post-w2); }
+[data-type="note"]  { --t-ink: var(--c-note-ink);  --t-vivid: var(--c-note);  --t-wash: var(--c-note-w);  --t-wash-2: var(--c-note-w2); }
+[data-type="log"]   { --t-ink: var(--c-log-ink);   --t-vivid: var(--c-log);   --t-wash: var(--c-log-w);   --t-wash-2: var(--c-log-w2); }
+[data-type="link"]  { --t-ink: var(--c-link-ink);  --t-vivid: var(--c-link);  --t-wash: var(--c-link-w);  --t-wash-2: var(--c-link-w2); }
+[data-type="list"]  { --t-ink: var(--c-list-ink);  --t-vivid: var(--c-list);  --t-wash: var(--c-list-w);  --t-wash-2: var(--c-list-w2); }
+[data-type="photo"] { --t-ink: var(--c-photo-ink); --t-vivid: var(--c-photo); --t-wash: var(--c-photo-w); --t-wash-2: var(--c-photo-w2); }
 
-html { -webkit-text-size-adjust: 100%; }
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  -webkit-text-size-adjust: 100%;
+  /* 不写 font-size，正文用 rem——原来那句 `font: 16px/1.75` 会把浏览器的字号设置
+     整个盖掉，把字调大的人调了个寂寞。 */
+}
 
 body {
   margin: 0;
-  background: var(--bg);
+  /* 页顶一层青色氛围：从上往下 26rem 淡出。整页宽的一块颜色，成本是一行渐变，
+     作用是让「还没滚动」的第一屏本身就有色，而不是等卡片来提供全部颜色。
+     只有 7%，暗色下也只是一点冷光，不影响页眉文字（--muted 落在最浓处仍有 5.15:1）。 */
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--accent) 7%, transparent), transparent 26rem)
+    no-repeat,
+    var(--bg);
   color: var(--fg);
-  font: 16px/1.75 ui-sans-serif, system-ui, -apple-system, "Segoe UI",
-        "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  font-size: var(--fs-base);
+  line-height: 1.8;          /* 中文没有词间空白，行距要比西文更松才不糊 */
+
+  /* 字体栈到 "Microsoft YaHei" 就断掉的话，Linux 和一部分安卓会顺着 sans-serif
+     落到 Noto Sans CJK **JP**：日文字形、句号从左下跑到居中。所以 SC 系必须在
+     兜底之前显式列全。 */
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Source Han Sans SC",
+    "Noto Sans SC", "Microsoft YaHei", "WenQuanYi Micro Hei", sans-serif;
   font-feature-settings: "kern";
+
+  /* 中文排版三件套，都是渐进增强：不认识的浏览器忽略，认识的白拿。
+     text-spacing-trim  标点挤压：连着的「。」「，」不再撑出两个全角空
+     text-autospace     中西文之间自动加四分之一空，不用手打空格
+     text-wrap: pretty  避免最后一行只剩一两个字 */
+  text-spacing-trim: space-first;
+  text-autospace: normal;
+  text-wrap: pretty;
+  overflow-wrap: break-word; /* 长 URL 在 375px 上不再把整页顶出横向滚动 */
 }
 
-.wrap { max-width: 46rem; margin: 0 auto; padding: 3rem 1.25rem 6rem; }
+code, kbd, pre, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", "Sarasa Mono SC", "Noto Sans Mono CJK SC", monospace;
+}
 
-a { color: inherit; text-decoration-color: var(--line); text-underline-offset: 3px; }
-a:hover { text-decoration-color: var(--accent); }
+/* 日期、序号一律等宽数字：不然「2026-09-01」比「2026-08-28」窄一点点，
+   后面跟着的「· 种子」就会一行一个位置地跳。 */
+time, .date, .num { font-variant-numeric: tabular-nums; }
 
-header.site { display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; margin-bottom: 2.5rem; }
-header.site .mark { font-size: 1.15rem; font-weight: 600; letter-spacing: .02em; text-decoration: none; }
-header.site .mark .cn { color: var(--muted); font-weight: 400; margin-left: .5rem; font-size: .95rem; }
-header.site nav { margin-left: auto; display: flex; gap: 1rem; font-size: .9rem; color: var(--muted); }
+.wrap {
+  max-width: var(--wrap);
+  margin: 0 auto;
+  padding: 3.5rem 1.25rem 6rem;
+}
 
-.filters { display: flex; gap: .4rem; flex-wrap: wrap; margin: 0 0 1.75rem; }
+a { color: inherit; text-decoration-color: var(--underline); text-underline-offset: .22em;
+    text-decoration-thickness: from-font; overflow-wrap: anywhere;
+    transition: color .15s var(--ease), text-decoration-color .15s var(--ease); }
+a:hover { color: var(--accent); text-decoration-color: currentColor; }
+
+/* 全站唯一的焦点样式。原来是零——键盘用户按 Tab 之后完全不知道自己在哪。
+   用青而不用条目自己那一支：焦点环必须在六种底色上都一样显眼，
+   跟着卡片变色的话，紫卡上的紫色焦点环就消失了。 */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: var(--r-sm); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; }
+  .card:hover, .card:focus-within { transform: none !important; }
+}
+
+/* ── 页眉 ─────────────────────────────────────────────────────────────────── */
+
+header.site {
+  display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap;
+  margin-bottom: 2.25rem; padding-bottom: 1.1rem; position: relative;
+}
+/* 页眉底下不再是一条淡出的细线，而是**六色条**：六段等宽硬边，顺序就是下面卡片会用到的
+   六个色相。它同时是三样东西——一块整页宽的色（面积）、一个字标（这站长这样）、
+   一张图例（颜色是有意思的，往下滚你会认出来）。成本是一条 linear-gradient。 */
+header.site::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 3px;
+  border-radius: 3px;
+  background: linear-gradient(90deg,
+    var(--c-post)  0 16.667%, var(--c-list)  0 33.333%, var(--c-note)  0 50%,
+    var(--c-log)   0 66.667%, var(--c-link)  0 83.333%, var(--c-photo) 0);
+}
+footer.site::before {
+  content: ""; position: absolute; left: 0; right: 0; height: 1px;
+  background: var(--rule);
+}
+
+header.site .mark {
+  font-size: var(--fs-md); font-weight: 700; letter-spacing: .01em;
+  text-decoration: none; color: var(--accent);
+}
+header.site .mark .cn {
+  color: var(--muted); font-weight: 500; margin-left: .55rem; font-size: var(--fs-sm);
+  letter-spacing: .06em;
+}
+header.site nav { margin-left: auto; display: flex; gap: .35rem; font-size: var(--fs-sm); }
+header.site nav a {
+  color: var(--muted); text-decoration: none; padding: .25rem .7rem; border-radius: 999px;
+  transition: background .15s var(--ease), color .15s var(--ease);
+}
+header.site nav a:hover { color: var(--accent); background: var(--chip-bg); }
+
+/* ── 筛选条 ───────────────────────────────────────────────────────────────── */
+
+/* 六个筛选钮各穿自己那一支颜色：它们在第一屏最上方，是整页第一处颜色。
+   未选中也上色（淡底 + 深字），因为它们同时是「颜色 = 类型」这条规则的说明书——
+   如果按钮全是灰的，读者要滚到第三张卡才可能反应过来卡片的颜色是有意思的。 */
+.filters { display: flex; gap: .45rem; flex-wrap: wrap; margin: 0 0 1.5rem; }
+
+/* UA 样式表的 [hidden]{display:none} 属于 user-agent origin，上面那条 display:flex
+   无论特异性高低都会赢它。不补这一条，index.astro 里的 hidden 就是摆设：
+   JS 失效时筛选条照样占位、按钮可聚焦，点下去什么都不发生。 */
+.filters[hidden] { display: none; }
 .filters button {
-  font: inherit; font-size: .82rem; line-height: 1.6;
-  padding: .1rem .6rem; border: 1px solid var(--line); border-radius: 999px;
-  background: transparent; color: var(--muted); cursor: pointer;
+  font: inherit; font-size: var(--fs-sm); line-height: 1.7; font-weight: 600;
+  padding: .18rem .85rem; border-radius: 999px; cursor: pointer;
+  background: var(--t-wash); color: var(--t-ink);
+  border: 1px solid color-mix(in srgb, var(--t-ink) 25%, transparent);
+  box-shadow: var(--shadow-0);
+  transition: background .15s var(--ease), color .15s var(--ease),
+              border-color .15s var(--ease), box-shadow .15s var(--ease);
 }
-.filters button[aria-pressed='true'] { background: var(--chip); color: var(--fg); border-color: transparent; }
+.filters button:hover { background: var(--t-wash-2); box-shadow: var(--shadow-1); }
+/* 选中态实心：这是首页唯一的「你现在在看什么」的指示，不能靠一点点浓淡差。
+   淡底 → 实心是明度反转，隔着半屏也看得出来。 */
+.filters button[aria-pressed="true"] {
+  background: var(--t-ink); color: var(--on-accent); border-color: transparent;
+  box-shadow: var(--shadow-1);
+}
 
-.stream { list-style: none; margin: 0; padding: 0; }
-.stream > li { padding: 1.1rem 0; border-top: 1px solid var(--line); }
-/* 分隔线画在上边，所以「当前可见的第一条」不该有。筛选后由脚本改挂 data-lead,
-   否则筛掉第一条之后，顶上会多出一条悬空的线。 */
-.stream > li[data-lead] { border-top: none; }
-.stream .meta { display: flex; gap: .6rem; align-items: baseline; font-size: .8rem; color: var(--muted); }
-.stream .title { display: block; margin-top: .15rem; font-size: 1.05rem; }
-.stream .excerpt { margin: .3rem 0 0; color: var(--muted); font-size: .92rem; }
+/* ── 时间流：卡片 ─────────────────────────────────────────────────────────── */
 
-.chip { padding: 0 .45rem; border-radius: 3px; background: var(--chip); font-size: .75rem; }
-.seed { color: var(--accent); }
+.stream { list-style: none; margin: 0; padding: 0; display: grid;
+  /* 轨道显式给 0 下限：grid 轨道的 base size 默认是 item 的 min-content，
+     而 body 的 overflow-wrap 只管换行、不改 min-content。于是正文里一条不可断的
+     长 URL 就能把整条轨道撑破视口——实测 200% 字号下 375px 视口横向滚动。 */
+  grid-template-columns: minmax(0, 1fr); gap: .85rem; }
 
-article.entry { max-width: var(--measure); }
-article.entry h1 { font-size: 1.6rem; line-height: 1.35; margin: 0 0 .4rem; }
-article.entry .meta { color: var(--muted); font-size: .85rem; margin-bottom: 2rem; }
-article.entry :is(h2, h3) { margin-top: 2.2rem; line-height: 1.4; }
-article.entry pre { padding: .9rem 1rem; overflow-x: auto; border-radius: 6px; font-size: .875rem; }
-article.entry :not(pre) > code { background: var(--chip); padding: .1rem .3rem; border-radius: 3px; font-size: .9em; }
-article.entry blockquote { margin: 1.4rem 0; padding-left: 1rem; border-left: 2px solid var(--line); color: var(--muted); }
-article.entry img { max-width: 100%; height: auto; }
+.card {
+  position: relative;
+  background: var(--t-wash);          /* ← 颜色的主战场。21 张卡 = 整页最大的一块色 */
+  border: 1px solid color-mix(in srgb, var(--t-ink) 18%, var(--t-wash));
+  border-radius: var(--r-card);
+  padding: 1.15rem 1.3rem;
+  box-shadow: var(--shadow-1), var(--shadow-in);
+  transition: transform .15s var(--ease), box-shadow .15s var(--ease),
+              background-color .15s var(--ease), border-color .15s var(--ease);
+}
+/* 顶端色条。inset 的上、左、右都是 -1px：正好盖住 1px 描边，色条于是齐着卡片外沿，
+   不用给卡片开 overflow:hidden（一开 hover 的 translateY 和外发光都会被裁）。
+   渐变从 ink 到 vivid：同一条里深浅都有，色条不至于是一根死板的实色。
+   两端对卡底分别是 5.26–5.93:1（深端）和 3.22–3.65:1（浅端）——浅端那支之所以定在
+   OKLCH L=0.60 而不是更亮的 0.66，就是为了让它也过 3:1；再亮一点更好看，但 2.5:1。 */
+.card::before {
+  content: ""; position: absolute; inset: -1px -1px auto; height: var(--bar);
+  border-radius: var(--r-card) var(--r-card) 0 0;
+  background: linear-gradient(90deg, var(--t-ink), var(--t-vivid));
+}
+.card:hover, .card:focus-within {
+  transform: translateY(-2px);
+  background: var(--t-wash-2);
+  border-color: color-mix(in srgb, var(--t-ink) 32%, var(--t-wash-2));
+  box-shadow: var(--shadow-2), var(--shadow-in);
+}
+/* 整张卡都是点击区：标题链接铺一个透明伪元素盖住整张卡（.t 保持 static，
+   伪元素于是定位到 position:relative 的 .card 上）。这样「卡上任意一处都能点」
+   不需要嵌套 <a>，也不需要一行 JS。
+   代价是焦点环会画在那个看不见的伪元素上——所以改由 .card:focus-within 来画。 */
+.card .t { position: static; }
+.card .t::after { content: ""; position: absolute; inset: 0; border-radius: inherit; }
+.card .t:focus-visible { outline: none; }
+.card:focus-within { outline: 2px solid var(--accent); outline-offset: 3px; }
 
-footer.site { margin-top: 4rem; padding-top: 1.25rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .82rem; }
+.card-head {
+  display: flex; align-items: center; gap: .55rem; flex-wrap: wrap;
+  font-size: var(--fs-sm); color: var(--muted); margin-bottom: .5rem;
+  padding-top: .2rem;        /* 给色条让一点位置，不然 chip 顶着色条 */
+}
+.card .date { letter-spacing: .01em; }
+
+.card .t {
+  display: block; text-decoration: none; color: var(--fg);
+  font-size: var(--fs-md); font-weight: 650; line-height: 1.45;
+  text-wrap: balance;
+  transition: color .15s var(--ease);
+}
+/* hover 时标题转成本条自己的颜色。颜色在这里第四次重复（条、底、chip、标题），
+   重复是有意的：一个信号出现四次，才可能在余光里成立。 */
+.card:hover .t { color: var(--t-ink); }
+.card .excerpt {
+  margin: .4rem 0 0; color: var(--muted); font-size: var(--fs-ms); line-height: 1.75;
+}
+
+/* —— 六种 type 长得不一样。共用一张卡等于没区分：扫一眼看不出
+      「这条是长文」还是「这条是随手一句」，那卡片就白做了。 —— */
+
+/* post：最大的卡、最大的标题、有摘要、有「读全文」。它是这个流里的主角，
+   所以颜色也给最足——色条从 4px 加到 5px，卡片底再压一层由深到浅的竖向渐变，
+   于是长文卡在一屏里是「颜色最重的那一张」。 */
+.card[data-type="post"] {
+  padding: 1.5rem 1.6rem 1.35rem;
+  --bar: 5px;
+  background: linear-gradient(180deg, var(--t-wash-2), var(--t-wash) 7rem);
+}
+.card[data-type="post"]:hover, .card[data-type="post"]:focus-within {
+  background: linear-gradient(180deg, var(--t-wash-2), var(--t-wash-2) 7rem);
+}
+/* 长文标题直接着色，不等 hover。22px 属于大字（只需 3:1），实测对底最低 5.50:1，
+   所以哪怕浏览器不放大字号也够正文级的 4.5:1 */
+.card[data-type="post"] .t {
+  font-size: var(--fs-lg); font-weight: 700; letter-spacing: -.005em;
+  color: var(--t-ink);
+}
+.card[data-type="post"] .excerpt { font-size: var(--fs-base); color: var(--fg); opacity: .82; }
+.card .more {
+  display: inline-block; margin-top: .9rem; color: var(--t-ink);
+  font-size: var(--fs-sm); font-weight: 600; letter-spacing: .02em;
+  transition: transform .15s var(--ease);
+}
+.card:hover .more { transform: translateX(3px); }
+
+/* log：紧凑卡，浮得最低，色条也最细。它要看起来像「一句话」，而不是「一条目录项」。
+   这类条数最多（这份内容里 8/21），所以它那一支色相本来就选了最安静的靛蓝——
+   最常出现的颜色如果最吵，整页就毁了。 */
+.card[data-type="log"] {
+  padding: .95rem 1.15rem;
+  --bar: 3px;
+  box-shadow: var(--shadow-0), var(--shadow-in);
+}
+.card[data-type="log"]:hover, .card[data-type="log"]:focus-within {
+  box-shadow: var(--shadow-1), var(--shadow-in);
+}
+/* 碎片（短记，以及任何没写标题的条目）：正文本身就是那行字，所以它按正文排，
+   不按标题排——粗体大字配一句大白话，看着像标题没写好，而不是像一条短记。 */
+.card[data-fragment] .t {
+  font-size: var(--fs-md); font-weight: 400; line-height: 1.75;
+  letter-spacing: 0; text-wrap: pretty;
+}
+
+/* link：外链是别人的东西。除了紫色底，再给一个 ↗ 和目标域名 */
+.card[data-type="link"] .t::before {
+  content: "↗"; color: var(--t-ink); font-weight: 400; margin-right: .4em;
+  display: inline-block; transition: transform .15s var(--ease);
+}
+.card[data-type="link"]:hover .t::before { transform: translate(2px, -2px); }
+.card .host {
+  display: block; margin-top: .5rem; font-size: var(--fs-sm); color: var(--t-ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: -.01em; word-break: break-all;
+}
+
+/* list：把前几项直接铺出来。清单的信息在项里，标题只是个文件名 */
+.card .preview { list-style: none; margin: .65rem 0 0; padding: 0; font-size: var(--fs-ms); color: var(--muted); }
+.card .preview li { position: relative; padding-left: 1.05rem; margin-top: .3rem; line-height: 1.7; }
+.card .preview li::before {
+  content: ""; position: absolute; left: .1rem; top: .72em;
+  width: 5px; height: 5px; border-radius: 1px; background: var(--t-vivid);
+}
+.card .preview li.rest { color: var(--muted); font-size: var(--fs-sm); }
+.card .preview li.rest::before { display: none; }
+
+/* chip：六种全部实心色块，不再是「一档实心两档描边其余中性」。
+   理由就是这一版要解决的问题——描边 chip 的着色面积约等于零，
+   而实心色块是首页唯一一处**饱和**的颜色，六个并排下来才有节奏。
+   字用纸色 --on-accent，对六支 ink 最低 5.91:1（12px 小字要 4.5:1）。 */
+.chip {
+  display: inline-flex; align-items: center;
+  padding: .14rem .58rem; border-radius: 999px;
+  background: var(--t-ink); border: 1px solid transparent;
+  color: var(--on-accent); font-size: var(--fs-xs); line-height: 1.7;
+  font-weight: 600; letter-spacing: .08em; white-space: nowrap;
+}
+
+/* status：种子 / 生长中。前面那个小圆点让它区别于 chip，不至于挤成两个一样的标签。
+   用条目自己那一支深色，跟 chip 的实心块拉开（一个是块，一个是字） */
+.status { display: inline-flex; align-items: center; gap: .3rem; font-size: var(--fs-xs); color: var(--t-ink); letter-spacing: .04em; }
+.status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+/* seed 与 growing 靠**形状**区分，不靠透明度：种子是空心的（还没长出来），
+   生长中是实心的。原来用 opacity: .8 表达这个差别，而 opacity 会乘到前景色上——
+   实测「生长中」因此掉到 3.96:1，过不了 AA。形状不影响对比度，语义也更直接。 */
+.status[data-status="seed"]::before {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px currentColor;
+}
+.seed { color: var(--t-ink); }   /* 旧标记，留着兼容还没改的页面 */
+
+.empty { color: var(--muted); }
+
+/* ── 条目页 ───────────────────────────────────────────────────────────────── */
+
+/* 阅读页也是一张卡：它和时间流是同一套语言，只是这张卡撑满了——
+   同样有顶端色条、同样是那一支淡底。从时间流点进来颜色不变，才像「同一个东西打开了」。
+   淡底 L=0.950，正文对底 14.90:1 起，读长文没有负担（这是有色纸，不是有色屏）。 */
+article.entry {
+  position: relative;
+  max-width: calc(var(--measure) + 4.6rem);
+  margin: 0 auto;
+  background: var(--t-wash);
+  border: 1px solid color-mix(in srgb, var(--t-ink) 18%, var(--t-wash));
+  border-radius: var(--r-card);
+  padding: 2.4rem 2.3rem 2.6rem;
+  box-shadow: var(--shadow-1), var(--shadow-in);
+}
+article.entry::before {
+  content: ""; position: absolute; inset: -1px -1px auto; height: 5px;
+  border-radius: var(--r-card) var(--r-card) 0 0;
+  background: linear-gradient(90deg, var(--t-ink), var(--t-vivid));
+}
+
+article.entry h1 {
+  font-size: var(--fs-2xl); font-weight: 700; line-height: 1.3;
+  letter-spacing: -.01em; margin: 0 0 .55rem; text-wrap: balance;
+}
+article.entry > .meta {
+  display: flex; align-items: center; gap: .55rem; flex-wrap: wrap;
+  color: var(--muted); font-size: var(--fs-sm);
+  margin: 0 0 1.9rem; padding-bottom: 1.4rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--t-ink) 22%, var(--t-wash));
+}
+
+/* ★ 全站最要紧的一条规则。
+   中文每一行都是满的，没有西文那种参差的右边界，所以**垂直空隙是唯一的分段线索**。
+   而 UA 默认的 p{margin:1em} 比行距 1.8em 还小——段间距小于行间距，等于没有段落，
+   整页糊成一块灰砖。这里显式给到 1.5em（叠在行距之上），让「换段」比「换行」明显。 */
+article.entry :is(p, ul, ol, blockquote, pre, table, figure, details) {
+  margin-block: 0 var(--flow);
+}
+/* 标题的上边距要明显大于段间距，否则「新的一节开始了」和「换了一段」看着一样重 */
+article.entry :is(h2, h3, h4) {
+  line-height: 1.45; font-weight: 700; letter-spacing: -.005em; text-wrap: balance;
+  margin-block: 2.4em .7em;
+}
+article.entry h2 { font-size: var(--fs-xl); }
+/* h3 着色：正文里唯一一处成规模用条目色的文字。22px 大字，对淡底 5.26:1 起。
+   h2 保持墨色——两级都上色的话，章节层级又要靠猜了。 */
+article.entry h3 { font-size: var(--fs-lg); color: var(--t-ink); }
+article.entry h4 { font-size: var(--fs-md); color: var(--muted); font-weight: 650; }
+article.entry > :last-child { margin-block-end: 0; }
+
+article.entry strong { font-weight: 700; }
+/* 中文没有斜体——斜体汉字是渲染器把字形拉歪的结果，笔画会糊。
+   中文的强调本来就有自己的记号：着重号。 */
+article.entry em {
+  font-style: normal;
+  -webkit-text-emphasis: filled dot var(--t-ink);
+  text-emphasis: filled dot var(--t-ink);
+  text-emphasis-position: under right;
+}
+
+article.entry :is(ul, ol) { padding-left: 1.35em; }
+article.entry li + li { margin-top: .45em; }
+article.entry li::marker { color: var(--t-ink); }
+
+/* 代码块保持纸白（Shiki 的 github-light 自带白底）：一块干净的白压在淡色底上，
+   反而把「这是代码不是正文」说得更清楚。 */
+article.entry pre {
+  padding: 1rem 1.15rem; overflow-x: auto; border-radius: var(--r-sm);
+  border: 1px solid color-mix(in srgb, var(--t-ink) 18%, var(--t-wash));
+  font-size: .9375rem; line-height: 1.7;
+  -webkit-overflow-scrolling: touch;
+}
+article.entry :not(pre) > code {
+  background: color-mix(in srgb, var(--t-ink) 10%, var(--t-wash));
+  border: 1px solid color-mix(in srgb, var(--t-ink) 22%, var(--t-wash));
+  padding: .05em .35em; border-radius: 5px; font-size: .875em;
+}
+
+/* 引用的竖线用鲜色那一支：它是纯装饰、不承载信息，正好放最跳的一支色 */
+article.entry blockquote {
+  margin-inline: 0; padding: .1rem 0 .1rem 1.15rem;
+  border-left: 3px solid var(--t-vivid);
+  color: var(--muted);
+}
+article.entry blockquote > :last-child { margin-block-end: 0; }
+
+/* 表格：原来完全没样式，在 375px 上直接把视口撑破。
+   给 table 自己开滚动（width:max-content + min-width:100%）就不用改 markdown 产物的结构 */
+article.entry table {
+  display: block; width: max-content; min-width: 100%; max-width: 100%;
+  overflow-x: auto; border-collapse: collapse; font-size: var(--fs-ms);
+}
+article.entry :is(th, td) {
+  padding: .5em .8em; text-align: left; vertical-align: top;
+  border-bottom: 1px solid color-mix(in srgb, var(--t-ink) 18%, var(--t-wash));
+}
+article.entry th { font-weight: 650; white-space: nowrap; }
+article.entry thead th { border-bottom: 2px solid var(--t-vivid); color: var(--fg); }
+article.entry tbody tr:last-child :is(th, td) { border-bottom: 0; }
+
+/* hr 用两端淡出的线，不是一根齐头齐尾的横杠。在条目页里它跟着条目的颜色走 */
+article.entry hr {
+  display: block; border: 0; height: 2px;
+  margin-block: 2.4em; border-radius: 2px;
+  background: linear-gradient(90deg,
+    transparent, var(--t-vivid) 22%, var(--t-vivid) 78%, transparent);
+  opacity: .55;
+}
+
+article.entry img {
+  display: block; max-width: 100%; height: auto; margin-inline: auto;
+  border-radius: var(--r-sm); box-shadow: var(--shadow-1);
+}
+article.entry figcaption { font-size: var(--fs-sm); color: var(--muted); text-align: center; margin-top: .6rem; }
+
+/* Shiki 双主题：astro.config 里配了 light + dark，但两套颜色都是行内 style 变量，
+   没人消费 --shiki-dark 的话暗色下代码块就是一块纯白。行内 style 优先级最高，
+   所以这里必须 !important——这不是偷懒，是唯一能盖住它的写法。 */
+@media (prefers-color-scheme: dark) {
+  article.entry .astro-code,
+  article.entry .astro-code span {
+    color: var(--shiki-dark) !important;
+    background-color: var(--shiki-dark-bg) !important;
+    font-style: var(--shiki-dark-font-style) !important;
+    font-weight: var(--shiki-dark-font-weight) !important;
+    text-decoration: var(--shiki-dark-text-decoration) !important;
+  }
+}
+
+/* ── 页脚 ─────────────────────────────────────────────────────────────────── */
+
+footer.site {
+  position: relative; margin-top: 4.5rem; padding-top: 1.4rem;
+  color: var(--muted); font-size: var(--fs-sm); letter-spacing: .04em;
+}
+footer.site::before { top: 0; }
+
+/* ── 窄屏 ─────────────────────────────────────────────────────────────────── */
+
+@media (max-width: 40rem) {
+  :root { --fs-2xl: 1.75rem; --fs-xl: 1.4rem; --fs-lg: 1.25rem; --r-card: 12px; }
+  .wrap { padding: 2.25rem .9rem 4rem; }
+  /* 375px 上左右各留 .9rem 页边 + 卡片 1.05rem 内边距 = 文字离屏幕边 ~31px。
+     再宽就挤，再窄卡片就贴边了。
+     色条不跟着变细：屏幕越窄，卡片越像一条一条的横杠，靠颜色分类的收益越大。 */
+  .card { padding: 1rem 1.05rem; border-radius: var(--r-card); }
+  .card[data-type="post"] { padding: 1.2rem 1.15rem 1.05rem; }
+  .card[data-type="log"] { padding: .85rem 1.05rem; }
+  article.entry { padding: 1.5rem 1.15rem 1.8rem; border-radius: var(--r-card); }
+  article.entry > .meta { margin-bottom: 1.4rem; padding-bottom: 1rem; }
+  header.site { gap: .5rem; margin-bottom: 1.75rem; }
+  header.site nav { margin-left: auto; gap: .15rem; }
+  header.site nav a { padding: .25rem .5rem; }
+  article.entry pre { padding: .85rem .9rem; font-size: .875rem; }
+  /* 窄屏上六个筛选钮会折成两行，间距收紧一点，免得它们比第一张卡还高 */
+  .filters { gap: .35rem; }
+  .filters button { padding: .18rem .7rem; }
+}
 
 /* 只给读屏器的文字：筛选之后播报还剩几条，屏幕上不占位置。 */
 .sr-only {
   position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
   overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
 }
+
+/* ── 这一版的取舍 ─────────────────────────────────────────────────────────────
+   1. 首页不再是「白纸黑字」。21 张卡摞下来是六种颜色的卡纸，比上一版热闹得多。
+      如果哪天觉得吵，改一个值就能整体退回去：把六支 w / w2 的 OKLCH 明度从
+      0.950 / 0.928 提到 0.975 / 0.960，色条和 chip 原样保留——颜色还在，面积减半。
+   2. 条目页的正文也落在淡色底上（而不是白底）。淡底 L=0.950，正文对底 14.90:1 起，
+      读长文没有负担；但这确实是「有色纸」而不是白纸，长文控可能不认。
+      要退的话只改一处：article.entry 的 background 换回 var(--surface)，
+      顶端色条和 h3 着色留着，条目页仍然认得出自己是哪一类。
+   3. 颜色承担了分类，但没有**只**由颜色承担：每张卡上 chip 里始终写着「文章 / 短记 / …」
+      那两个字。色觉障碍下六个色相会塌成三四档明度差，标签是那时候唯一还站得住的东西——
+      所以 chip 是实心色块**加**文字，不是纯色点。
+   4. --accent（青）刻意不在六色之内。代价是全站多记一支颜色；换来的是「链接是链接、
+      条目是条目」——否则 hover 一个链接会跟某一类条目撞色，颜色的意思就散了。
+   ────────────────────────────────────────────────────────────────────────── */

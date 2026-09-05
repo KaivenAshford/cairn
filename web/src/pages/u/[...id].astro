@@ -1,0 +1,30 @@
+---
+import { render } from 'astro:content';
+import Base from '../../layouts/Base.astro';
+import { unlistedEntries, displayTitle, excerpt, formatDate, TYPE_LABEL, type Entry } from '../../lib/entries';
+
+/**
+ * unlisted：靠「搜不到、猜不到」而不是靠认证。
+ * 文件名就是 URL，因此 unlisted 条目的文件名必须是长随机串。
+ * 真正泄露了有后果的东西请用 circle/private，走服务端。见 ARCHITECTURE.md 第 2 节。
+ */
+export async function getStaticPaths() {
+  const entries = await unlistedEntries();
+  return entries.map((entry) => ({ params: { id: entry.id }, props: { entry } }));
+}
+
+const { entry } = Astro.props as { entry: Entry };
+const { Content } = await render(entry);
+---
+
+<Base title={displayTitle(entry)} description={excerpt(entry, 140)} noindex={true}>
+  <article class="entry">
+    <h1>{displayTitle(entry)}</h1>
+    <div class="meta">
+      <span class="chip">{TYPE_LABEL[entry.data.type] ?? entry.data.type}</span>
+      {' '}<time datetime={entry.data.created.toISOString()}>{formatDate(entry.data.created)}</time>
+      {' '}· 未列出，仅通过链接访问
+    </div>
+    <Content />
+  </article>
+</Base>

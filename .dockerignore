@@ -1,0 +1,9 @@
+# 构建上下文是整个仓库，但 Dockerfile 只需要 server/。
+# 不排除的话每次 build 都要把 200MB+ 的 node_modules 打给 daemon,
+# 而且 .env（生产 token）也会进上下文——今天不会被 COPY 进镜像层，
+# 但将来任何一行 `COPY . .` 就会。
+*
+!server/go.mod
+!server/go.sum
+!server/*.go
+server/*_test.go

@@ -1,0 +1,16 @@
+---
+import Base from '../layouts/Base.astro';
+
+// 没有这一页时 Caddy 的 file_server 会返回一张空白的自带 404。
+export const prerender = true;
+---
+
+<Base title="没有这一页" noindex={true}>
+  <article class="entry">
+    <h1>没有这一页</h1>
+    <p style="color: var(--muted)">
+      链接可能过期了，或者这条内容不是公开的。
+    </p>
+    <p><a href="/">回时间流</a></p>
+  </article>
+</Base>

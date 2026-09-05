@@ -1,0 +1,42 @@
+# cairn 部署。静态产物由本机 `scripts/publish` 生成，Caddy 直接从磁盘发；
+# 容器里只跑那个必须常驻的进程——Go 写入服务。部署形态见 deploy/README.md。
+name: cairn
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+    image: cairn-server:latest
+    init: true
+    restart: unless-stopped
+    env_file:
+      - path: ../.env
+        required: true
+    # 镜像里默认以 nonroot（uid 65532）运行，而下面那个 volume 是宿主机上的普通目录，
+    # 属于 clone 仓库的那个用户。uid 对不上的话，写入通道对每一条记录都返回 500
+    # ——日志里是 permission denied，响应里只有一句 internal error。
+    # 所以按宿主机上的属主来跑。取值：`id -u` / `id -g`，填进 .env。
+    user: "${CAIRN_UID:-1000}:${CAIRN_GID:-1000}"
+    environment:
+      # 容器内固定路径；宿主机的实际位置由下面的 volumes 决定。
+      CAIRN_ADDR: 0.0.0.0:8787
+      CAIRN_CONTENT_DIR: /content/entries
+      # distroless 里没有 /etc/localtime，不设这个 Go 的 time.Local 就是 UTC——
+      # 条目的 created 和 id 里的日期前缀都会按 UTC 算，晚上写的东西标成前一天。
+      TZ: ${TZ:-Asia/Shanghai}
+    # 这个目录必须**先存在**再起容器。缺了的话 dockerd 会以 root 身份把它建出来，
+    # 于是上面那个 user 依然写不进去。它是另一个 private 仓库（见 web/content/README.md），
+    # 新机器上 clone 主仓不会带上它——不先 clone 它，条目会落进一个空的、
+    # 不受任何 git 管理的目录，「服务器炸了不丢」就没了。
+    volumes:
+      - ../web/content/entries:/content/entries
+    # 只绑回环：公网流量一律经 Caddy。直接可达的 8787 等于把写入通道晾在外面。
+    ports:
+      - "127.0.0.1:8787:8787"
+    healthcheck:
+      test: ["CMD", "/cairn-server", "-healthcheck"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

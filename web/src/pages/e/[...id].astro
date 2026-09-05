@@ -1,0 +1,26 @@
+---
+import { render } from 'astro:content';
+import Base from '../../layouts/Base.astro';
+import { publicEntries, displayTitle, excerpt, formatDate, TYPE_LABEL, type Entry } from '../../lib/entries';
+
+export async function getStaticPaths() {
+  const entries = await publicEntries();
+  return entries.map((entry) => ({ params: { id: entry.id }, props: { entry } }));
+}
+
+const { entry } = Astro.props as { entry: Entry };
+const { Content } = await render(entry);
+---
+
+<Base title={displayTitle(entry)} description={excerpt(entry, 140)}>
+  <article class="entry">
+    <h1>{displayTitle(entry)}</h1>
+    <div class="meta">
+      <span class="chip">{TYPE_LABEL[entry.data.type] ?? entry.data.type}</span>
+      {' '}<time datetime={entry.data.created.toISOString()}>{formatDate(entry.data.created)}</time>
+      {entry.data.updated && <> · 更新于 {formatDate(entry.data.updated)}</>}
+      {entry.data.status === 'seed' && <> · <span class="seed">种子，还没想清楚</span></>}
+    </div>
+    <Content />
+  </article>
+</Base>

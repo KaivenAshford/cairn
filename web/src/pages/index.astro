@@ -1,0 +1,72 @@
+---
+import Base from '../layouts/Base.astro';
+import { publicEntries, displayTitle, excerpt, formatDate, TYPE_LABEL } from '../lib/entries';
+
+const entries = await publicEntries();
+const types = [...new Set(entries.map((e) => e.data.type))];
+---
+
+<Base description="一个人的可浏览版本。">
+  {types.length > 1 && (
+    <div class="filters" id="filters" role="group" aria-label="按类型筛选" hidden>
+      <button data-type="all" aria-pressed="true">全部</button>
+      {types.map((t) => <button data-type={t} aria-pressed="false">{TYPE_LABEL[t] ?? t}</button>)}
+    </div>
+  )}
+
+  <ul class="stream" id="stream">
+    {entries.map((e, i) => (
+      <li data-type={e.data.type} data-lead={i === 0 ? '' : undefined}>
+        <div class="meta">
+          <span class="chip">{TYPE_LABEL[e.data.type] ?? e.data.type}</span>
+          <time datetime={e.data.created.toISOString()}>{formatDate(e.data.created)}</time>
+          {e.data.status === 'seed' && <span class="seed">· 种子</span>}
+        </div>
+        <a class="title" href={`/e/${e.id}/`}>{displayTitle(e)}</a>
+        {e.data.type !== 'post' && <p class="excerpt">{excerpt(e)}</p>}
+      </li>
+    ))}
+  </ul>
+
+  <p class="sr-only" id="filter-status" role="status" aria-live="polite"></p>
+
+  {entries.length === 0 && (
+    <p style="color: var(--muted)">
+      还没有公开条目。往 <code>web/content/entries/</code> 里放一个 markdown,
+      或者打通写入通道让 <code>server</code> 帮你放。
+    </p>
+  )}
+</Base>
+
+<script>
+  // 纯客户端筛选：条目量到几千条之前都不值得为此引入框架。
+  const filters = document.getElementById('filters');
+  const stream = document.getElementById('stream');
+  const status = document.getElementById('filter-status');
+
+  // 按钮点了没反应比没有按钮更糟，所以 JS 到位之前不显示它们。
+  filters?.removeAttribute('hidden');
+
+  filters?.addEventListener('click', (ev) => {
+    const btn = (ev.target as HTMLElement).closest('button');
+    if (!btn || !stream) return;
+    const want = btn.dataset.type;
+    filters.querySelectorAll('button').forEach((b) =>
+      b.setAttribute('aria-pressed', String(b === btn)),
+    );
+
+    let lead: HTMLElement | null = null;
+    stream.querySelectorAll<HTMLElement>('li').forEach((li) => {
+      li.hidden = want !== 'all' && li.dataset.type !== want;
+      // 分隔线画在 li 的上边，筛掉第一条之后可见的首条会多出一条线。
+      li.removeAttribute('data-lead');
+      if (!li.hidden && !lead) lead = li;
+    });
+    (lead as HTMLElement | null)?.setAttribute('data-lead', '');
+
+    if (status) {
+      const n = stream.querySelectorAll('li:not([hidden])').length;
+      status.textContent = `${btn.textContent}:${n} 条`;
+    }
+  });
+</script>

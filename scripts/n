@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# 终端捕获入口：n "刚想到的一件事"
+#
+#   n "想法"                        默认 log / private
+#   n -v public -t post -T "标题" "正文"
+#   echo "长内容" | n -v circle
+#   n -i now "在建这个站"            改写 id 为 now 的那条（不存在就建）
+#
+# 需要 CAIRN_URL 与 CAIRN_TOKEN（可放在 ~/.cairnrc 里 export）。
+set -euo pipefail
+
+[ -f "${HOME}/.cairnrc" ] && . "${HOME}/.cairnrc"
+: "${CAIRN_URL:?未设置 CAIRN_URL}"
+: "${CAIRN_TOKEN:?未设置 CAIRN_TOKEN}"
+
+type="" visibility="" title="" status="" id=""
+while getopts "t:v:T:s:i:h" opt; do
+  case "$opt" in
+    t) type=$OPTARG ;;
+    v) visibility=$OPTARG ;;
+    T) title=$OPTARG ;;
+    s) status=$OPTARG ;;
+    i) id=$OPTARG ;;
+    h) sed -n '2,10p' "$0"; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+# 只有新建时才套默认值。更新（-i）时一律留空，让服务端沿用那条已有的字段——
+# 否则 `n -i now "新内容"` 会把一条 note 变成 log、把一条 public 从站上抹掉：
+# 漏写一个开关不该改变已发布内容的类型和可见度。
+if [ -z "$id" ]; then
+  : "${type:=log}"
+  : "${visibility:=private}"
+fi
+
+if [ $# -gt 0 ]; then text="$*"; else text=$(cat); fi
+[ -n "${text//[[:space:]]/}" ] || { echo "空内容，没写。" >&2; exit 1; }
+
+payload=$(TEXT="$text" TYPE="$type" VIS="$visibility" TITLE="$title" STATUS="$status" ID="$id" \
+  python3 -c '
+import json, os
+d = {"text": os.environ["TEXT"]}
+for key, env in (("type", "TYPE"), ("visibility", "VIS"),
+                 ("title", "TITLE"), ("status", "STATUS"), ("id", "ID")):
+    if os.environ[env]:
+        d[key] = os.environ[env]
+print(json.dumps(d, ensure_ascii=False))')
+
+curl -sS --fail-with-body -X POST "${CAIRN_URL%/}/api/write" \
+  -H "Authorization: Bearer ${CAIRN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "$payload"
+echo

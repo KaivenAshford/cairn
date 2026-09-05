@@ -1,0 +1,26 @@
+---
+import { render } from 'astro:content';
+import Base from '../layouts/Base.astro';
+import { publicEntries, excerpt, formatDate } from '../lib/entries';
+
+// /now 是一张会被覆盖、不留历史的单页：现在在做什么。
+// 它是最需要频繁改的一页，所以写入通道支持按 id 更新：`n -i now "…"`。
+const now = (await publicEntries()).find((e) => e.id === 'now');
+const Content = now ? (await render(now)).Content : null;
+---
+
+<Base title="现在" description={now ? excerpt(now, 140) : undefined}>
+  <article class="entry">
+    <h1>现在</h1>
+    {now && Content ? (
+      <>
+        <div class="meta">更新于 {formatDate(now.data.updated ?? now.data.created)}</div>
+        <Content />
+      </>
+    ) : (
+      <p style="color: var(--muted)">
+        还没写。放一个 <code>web/content/entries/now.md</code> 就会出现在这里。
+      </p>
+    )}
+  </article>
+</Base>

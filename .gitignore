@@ -1,0 +1,17 @@
+# 依赖与产物
+node_modules/
+dist/
+dist.next/
+dist.old/
+.astro/
+server/cairn-server
+server/server
+data/
+
+# 内容：单独的 private 仓库，永远不进这个仓库。
+# 代码仓里只有 web/content/fixtures/ 那几条示例，用 scripts/seed 放进来。
+web/content/entries/
+
+# 环境
+.env
+*.local

@@ -1,0 +1,80 @@
+:root {
+  --bg: #fbfaf7;
+  --fg: #1b1a17;
+  --muted: #6d6a62;
+  --line: #e2ded4;
+  --accent: #7a5c2e;
+  --chip: #efece4;
+  --measure: 34rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14130f;
+    --fg: #e8e4da;
+    --muted: #918c80;
+    --line: #2b2823;
+    --accent: #c9a45f;
+    --chip: #221f1a;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.75 ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+        "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  font-feature-settings: "kern";
+}
+
+.wrap { max-width: 46rem; margin: 0 auto; padding: 3rem 1.25rem 6rem; }
+
+a { color: inherit; text-decoration-color: var(--line); text-underline-offset: 3px; }
+a:hover { text-decoration-color: var(--accent); }
+
+header.site { display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; margin-bottom: 2.5rem; }
+header.site .mark { font-size: 1.15rem; font-weight: 600; letter-spacing: .02em; text-decoration: none; }
+header.site .mark .cn { color: var(--muted); font-weight: 400; margin-left: .5rem; font-size: .95rem; }
+header.site nav { margin-left: auto; display: flex; gap: 1rem; font-size: .9rem; color: var(--muted); }
+
+.filters { display: flex; gap: .4rem; flex-wrap: wrap; margin: 0 0 1.75rem; }
+.filters button {
+  font: inherit; font-size: .82rem; line-height: 1.6;
+  padding: .1rem .6rem; border: 1px solid var(--line); border-radius: 999px;
+  background: transparent; color: var(--muted); cursor: pointer;
+}
+.filters button[aria-pressed='true'] { background: var(--chip); color: var(--fg); border-color: transparent; }
+
+.stream { list-style: none; margin: 0; padding: 0; }
+.stream > li { padding: 1.1rem 0; border-top: 1px solid var(--line); }
+/* 分隔线画在上边，所以「当前可见的第一条」不该有。筛选后由脚本改挂 data-lead,
+   否则筛掉第一条之后，顶上会多出一条悬空的线。 */
+.stream > li[data-lead] { border-top: none; }
+.stream .meta { display: flex; gap: .6rem; align-items: baseline; font-size: .8rem; color: var(--muted); }
+.stream .title { display: block; margin-top: .15rem; font-size: 1.05rem; }
+.stream .excerpt { margin: .3rem 0 0; color: var(--muted); font-size: .92rem; }
+
+.chip { padding: 0 .45rem; border-radius: 3px; background: var(--chip); font-size: .75rem; }
+.seed { color: var(--accent); }
+
+article.entry { max-width: var(--measure); }
+article.entry h1 { font-size: 1.6rem; line-height: 1.35; margin: 0 0 .4rem; }
+article.entry .meta { color: var(--muted); font-size: .85rem; margin-bottom: 2rem; }
+article.entry :is(h2, h3) { margin-top: 2.2rem; line-height: 1.4; }
+article.entry pre { padding: .9rem 1rem; overflow-x: auto; border-radius: 6px; font-size: .875rem; }
+article.entry :not(pre) > code { background: var(--chip); padding: .1rem .3rem; border-radius: 3px; font-size: .9em; }
+article.entry blockquote { margin: 1.4rem 0; padding-left: 1rem; border-left: 2px solid var(--line); color: var(--muted); }
+article.entry img { max-width: 100%; height: auto; }
+
+footer.site { margin-top: 4rem; padding-top: 1.25rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .82rem; }
+
+/* 只给读屏器的文字：筛选之后播报还剩几条，屏幕上不占位置。 */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
+}

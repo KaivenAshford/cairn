@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# 把 fixtures 里的示例条目放进内容目录，用于本地开发。
+#
+#   scripts/seed          # 内容目录为空时才放，已有内容不动
+#   scripts/seed -f       # 强制覆盖同名文件
+#
+# 真实内容在一个单独的 private 仓库里（见 web/content/README.md），
+# 代码仓里只有 fixtures。所以干净 clone 之后 `npm run dev` 会是个空站，
+# 跑一次这个脚本就有东西看了。
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+SRC=web/content/fixtures
+DST=web/content/entries
+
+force=false
+[ "${1:-}" = "-f" ] && force=true
+
+mkdir -p "$DST"
+
+if [ "$force" = false ] && [ -n "$(ls -A "$DST" 2>/dev/null)" ]; then
+  echo "$DST 里已经有东西了，不动它。要覆盖用 scripts/seed -f。"
+  exit 0
+fi
+
+n=0
+for f in "$SRC"/*.md; do
+  [ -e "$f" ] || continue
+  cp "$f" "$DST/"
+  n=$((n + 1))
+done
+echo "放了 $n 条示例条目进 $DST"

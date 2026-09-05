@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# 构建并发布静态产物。
+#
+#   scripts/publish
+#
+# 为什么不直接 `npm run build`:astro build 会先清空 outDir 再生成。而 outDir 就是
+# Caddy 的 docroot(deploy/Caddyfile 里的 `root * /srv/cairn/web/dist`），于是一次失败的
+# 构建会做两件坏事——把线上所有页面删光，以及在 docroot 里留下一批中间 chunk,
+# 那些 .mjs 文件含**全部条目的正文**，包括触发失败的那条私密条目。
+#
+# 而构建失败是会发生的：公开目录里混进一条 private 就会失败（那正是设计要的），
+# 标题里粘进一个控制字符也会失败。这条路径上不能让「构建挂了」升级成「站没了」。
+#
+# 所以先构建到一个临时目录，只有成功了才换上去。
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+ROOT=$(pwd)
+OUT="$ROOT/web/dist"
+STAGE="$ROOT/web/dist.next"
+PREV="$ROOT/web/dist.old"
+
+rm -rf "$STAGE" "$PREV"
+trap 'rm -rf "$STAGE"' EXIT
+
+if ! (cd web && npx astro build --outDir "$STAGE"); then
+  echo >&2
+  echo "构建失败，已发布的产物没有动。" >&2
+  exit 1
+fi
+
+if [ ! -f "$STAGE/index.html" ]; then
+  echo "构建报告成功，但产物里没有首页——不敢换上去。" >&2
+  exit 1
+fi
+
+# 换上去。同一个文件系统，两次 mv 都是 rename，中间的窗口是毫秒级。
+[ -d "$OUT" ] && mv "$OUT" "$PREV"
+mv "$STAGE" "$OUT"
+rm -rf "$PREV"
+
+echo "已发布：$(find "$OUT" -name '*.html' | wc -l | tr -d ' ') 个页面 → $OUT"

@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# 可见度的安全性质测试。
+#
+# 这些不是功能性质，是安全性质：「标了 private 却被构建进公开产物」不会有人报 bug，
+# 它安静地发生，然后一直公开着。所以每一条都要有一个跑得起来的断言，而不是靠记得。
+#
+#   scripts/test-visibility
+#
+# 做法是往内容目录里放临时 markdown、跑真正的 astro build、断言构建的成败与产物，
+# 结束时无论成败都清掉临时文件并重建一次干净产物。
+#
+# 内容目录是一个 private 仓库（见 web/content/README.md），四层可见度的条目混在一起，
+# 由 frontmatter 决定谁进 dist。这条防线是软的（字段过滤），所以下面第 1、2 组
+# 是这个文件里最要紧的断言：private / circle 的**任何**痕迹都不能出现在 dist 里。
+set -uo pipefail
+
+cd "$(dirname "$0")/.." || exit 1
+ENTRIES=web/content/entries
+declare -a MADE=()
+fails=0
+
+cleanup() {
+  for f in "${MADE[@]:-}"; do rm -f "$f"; done
+  rm -rf "$ENTRIES/2026"
+  # 测试里那些**故意失败**的构建已经清空过 docroot，并留下一批含条目正文的中间 chunk。
+  # 先整个删掉再走安全发布路径：宁可 dist 是空的，也不能是「空的 + 泄露的 .mjs」。
+  # 失败要喊出来，不能用 `|| true` 咽掉——那正是这个脚本在防的事。
+  rm -rf web/dist
+  if ! scripts/publish >/dev/null; then
+    echo >&2
+    echo >&2 "⚠ 收尾构建失败：工作树本身就构建不过，web/dist 已清空且没有恢复。"
+    echo >&2 "  先修好工作树，再跑一次 scripts/publish。"
+  fi
+}
+trap cleanup EXIT
+
+entry() { # entry <文件名> <内容>
+  local path="$ENTRIES/$1.md"
+  MADE+=("$path")
+  mkdir -p "$(dirname "$path")"
+  printf '%s\n' "$2" > "$path"
+}
+
+build() { (cd web && npm run build 2>&1); }
+
+ok()  { printf '  \033[32m✓\033[0m %s\n' "$1"; }
+bad() { printf '  \033[31m✗\033[0m %s\n' "$1"; fails=$((fails + 1)); }
+
+# leaks <标记> —— dist 里有没有这个标记
+leaks() { grep -rqF "$1" web/dist 2>/dev/null; }
+
+echo "可见度安全性质："
+
+# ── 1. private / circle 条目不进产物，一个字都不能漏 ─────────────────────────
+entry zz-private '---
+title: ZZ_PRIVATE_TITLE 不该出现在产物里
+type: post
+visibility: private
+created: 2026-01-01
+tags: [ZZ_PRIVATE_TAG]
+---
+
+ZZ_PRIVATE_BODY'
+entry zz-circle '---
+title: ZZ_CIRCLE_TITLE
+type: note
+visibility: circle
+created: 2026-01-01
+---
+
+ZZ_CIRCLE_BODY'
+if build >/dev/null; then
+  hit=0
+  for marker in ZZ_PRIVATE_TITLE ZZ_PRIVATE_BODY ZZ_PRIVATE_TAG ZZ_CIRCLE_TITLE ZZ_CIRCLE_BODY zz-private zz-circle; do
+    if leaks "$marker"; then bad "private/circle 的 '$marker' 出现在了 dist 里"; hit=1; fi
+  done
+  [ "$hit" -eq 0 ] && ok "private 与 circle 的标题、正文、标签、id 都不进 dist"
+  if [ -e web/dist/e/zz-private ] || [ -e web/dist/e/zz-circle ]; then
+    bad "private/circle 条目生成了页面"
+  else
+    ok "private 与 circle 条目不生成页面"
+  fi
+else
+  bad "混入 private/circle 条目让构建失败了——它们应当被过滤掉，不是让构建挂掉"
+fi
+rm -f "$ENTRIES/zz-private.md" "$ENTRIES/zz-circle.md"
+
+# ── 2. 忘写 visibility → 默认 private → 同样不进产物 ─────────────────────────
+entry zz-novis '---
+title: ZZ_NOVIS_TITLE
+type: log
+created: 2026-01-01
+---
+
+ZZ_NOVIS_BODY'
+if build >/dev/null; then
+  if leaks ZZ_NOVIS_BODY || leaks ZZ_NOVIS_TITLE; then
+    bad "忘写 visibility 的条目被公开了——默认值应当是 private"
+  else
+    ok "忘写 visibility 时默认 private，不进 dist"
+  fi
+else
+  bad "忘写 visibility 让构建失败了"
+fi
+rm -f "$ENTRIES/zz-novis.md"
+
+# ── 3. unlisted 用了猜得到的文件名 → 大声失败 ────────────────────────────────
+# 这是唯一一层强度取决于文件名的可见度，所以它必须失败，而不是被悄悄过滤掉。
+entry zz-guessable '---
+title: 猜得到的文件名
+type: log
+visibility: unlisted
+created: 2026-01-01
+---
+
+ZZ_GUESSABLE_BODY'
+if out=$(build); then
+  bad "unlisted 用可猜的文件名，构建居然通过了"
+elif ! grep -qF "zz-guessable" <<<"$out"; then
+  bad "unlisted 文件名检查失败了，但没说清是哪一条"
+else
+  ok "unlisted 用可猜的文件名会让构建失败"
+fi
+rm -f "$ENTRIES/zz-guessable.md"
+
+# ── 4. 非法 type / 拼错的 visibility → schema 拒绝（fail-closed） ────────────
+entry zz-badtype '---
+type: video
+visibility: public
+created: 2026-01-01
+---
+
+ZZ_BADTYPE_BODY'
+if build >/dev/null; then bad "非法 type 居然通过了"; else ok "非法 type 被 schema 拒绝"; fi
+rm -f "$ENTRIES/zz-badtype.md"
+
+entry zz-typo '---
+type: log
+visibility: pubic
+created: 2026-01-01
+---
+
+ZZ_TYPO_BODY'
+if build >/dev/null; then bad "visibility 拼错居然通过了"; else ok "visibility 拼错时 fail-closed"; fi
+rm -f "$ENTRIES/zz-typo.md"
+
+# ── 5. 合法的 unlisted：随机路径、noindex、不上首页、不漏进别的产物 ──────────
+RAND=$(openssl rand -hex 16)
+entry "$RAND" '---
+title: 未列出的条目
+type: log
+visibility: unlisted
+created: 2026-01-01
+---
+
+ZZ_UNLISTED_SECRET_BODY'
+if build >/dev/null; then
+  page="web/dist/u/$RAND/index.html"
+  if [ -f "$page" ]; then ok "unlisted 生成在 /u/<随机名>/"; else bad "unlisted 没有生成在 /u/$RAND/"; fi
+
+  if grep -q 'name="robots" content="noindex, nofollow"' "$page" 2>/dev/null; then
+    ok "unlisted 页面带 noindex, nofollow"
+  else
+    bad "unlisted 页面缺 noindex"
+  fi
+
+  if grep -q "$RAND" web/dist/index.html; then bad "unlisted 出现在首页"; else ok "unlisted 不出现在首页"; fi
+
+  hits=$(grep -rl ZZ_UNLISTED_SECRET_BODY web/dist 2>/dev/null | wc -l)
+  if [ "$hits" -eq 1 ]; then
+    ok "unlisted 正文只出现在它自己那一页"
+  else
+    bad "unlisted 正文出现在 $hits 个产物里，应当只有 1 个"
+  fi
+else
+  bad "合法的 unlisted 条目让构建失败了"
+fi
+rm -f "$ENTRIES/$RAND.md"
+
+# ── 6. 按目录归档的 unlisted：随机段在目录名上，URL 同样猜不到 ───────────────
+RAND2=$(openssl rand -hex 16)
+entry "2026/$RAND2" '---
+title: 归档在子目录里的未列出条目
+type: log
+visibility: unlisted
+created: 2026-01-01
+---
+
+ZZ_SUBDIR_BODY'
+if build >/dev/null; then
+  ok "子目录里的 unlisted（随机段在路径中）能正常构建"
+else
+  bad "子目录里的 unlisted 让构建失败了——守卫应当看路径段，不是整个 id"
+fi
+rm -rf "$ENTRIES/2026"
+
+# ── 7. 摘要与标题：代码里的标识符不能被当成 markdown 标记吃掉 ───────────────
+# 这不是安全性质，但它出现在首页标题和 <meta name="description"> 里，
+# 而这个站会大量写到环境变量名和路径。
+#
+# 注意下面那个标记不带下划线：带的话，「下划线被当斜体吃掉」这条缺陷会连标记一起改写，
+# grep 于是永远匹配不到，测试看起来通过了——一个测自己测不出来的测试。
+entry zz-excerpt '---
+type: log
+visibility: public
+created: 2026-01-01
+---
+
+环境变量是 `CAIRN_CONTENT_DIR`，模式是 `**/*.md`。
+
+```js
+const zzCodeMustNotLeak = 1;'
+if build >/dev/null; then
+  home=web/dist/index.html
+  if grep -q "CAIRN_CONTENT_DIR" "$home"; then
+    ok "反引号里的标识符原样保留（下划线不是斜体标记）"
+  else
+    bad "CAIRN_CONTENT_DIR 被当成 markdown 标记改写了（应当原样出现在摘要里）"
+  fi
+  if grep -q "zzCodeMustNotLeak" "$home"; then
+    bad "未闭合代码块的内容漏进了摘要"
+  else
+    ok "未闭合的代码块不进摘要"
+  fi
+else
+  bad "含代码的条目让构建失败了"
+fi
+rm -f "$ENTRIES/zz-excerpt.md"
+
+# ── 8. 构建失败时不能把已发布的产物留在半截状态 ──────────────────────────────
+# scripts/publish 存在的理由：astro build 会先清空 outDir，而 outDir 就是线上 docroot。
+entry zz-breaks-build '---
+type: log
+visibility: unlisted
+created: 2026-01-01
+---
+
+ZZ_BREAKS_BUILD'
+before=$(find web/dist -name '*.html' 2>/dev/null | wc -l)
+scripts/publish >/dev/null 2>&1
+after=$(find web/dist -name '*.html' 2>/dev/null | wc -l)
+if [ "$before" -eq "$after" ] && [ "$after" -gt 0 ]; then
+  ok "构建失败时 publish 不动已发布的产物（$after 个页面还在）"
+else
+  bad "构建失败后已发布的产物从 $before 个页面变成 $after 个"
+fi
+if leaks ZZ_BREAKS_BUILD; then
+  bad "失败构建的正文残留在了 web/dist 里"
+else
+  ok "失败构建的正文没有进 web/dist"
+fi
+rm -f "$ENTRIES/zz-breaks-build.md"
+
+echo
+if [ "$fails" -eq 0 ]; then
+  echo "全部通过。"
+else
+  echo "$fails 条不通过。"
+fi
+exit "$fails"

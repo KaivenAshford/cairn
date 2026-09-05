@@ -1,0 +1,42 @@
+---
+import '../styles/global.css';
+
+interface Props {
+  title?: string;
+  description?: string;
+  /** unlisted 页面必须 noindex：它靠「搜不到」而不是靠认证。见 ARCHITECTURE.md 第 2 节。 */
+  noindex?: boolean;
+}
+
+const { title, description, noindex = false } = Astro.props;
+const fullTitle = title ? `${title} · cairn` : 'cairn · 起居注';
+---
+
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{fullTitle}</title>
+    {description && <meta name="description" content={description} />}
+    {noindex && <meta name="robots" content="noindex, nofollow" />}
+    <link rel="canonical" href={new URL(Astro.url.pathname, Astro.site)} />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="site">
+        <a class="mark" href="/">cairn<span class="cn">起居注</span></a>
+        <nav>
+          <a href="/">时间流</a>
+          <a href="/now">现在</a>
+        </nav>
+      </header>
+
+      <main><slot /></main>
+
+      <footer class="site">
+        一次放一块石头。
+      </footer>
+    </div>
+  </body>
+</html>

@@ -269,12 +269,15 @@ if build >/dev/null; then
   if grep -q '<span class="host">github.com</span>' "$home"; then ok "外链卡显示目标域名"
   else bad "外链卡没显示域名——「这条链接通向哪」是外链最重要的一条信息"; fi
 
-  # 清单卡里铺出来的预览项也是 <li>，但没有 data-type。筛选脚本要是抓所有 li，
-  # 一按「清单」这些预览项会因为「type 不匹配」被整排隐藏，卡片只剩一个孤零零的标题。
-  if grep -q "querySelectorAll<HTMLElement>(':scope > li')\|querySelectorAll(':scope > li')" web/src/pages/index.astro; then
-    ok "筛选只抓顶层 li（清单卡的预览项不会被连坐隐藏）"
+  # 时间流里的顶层 <li> 有两种（卡片、年份标记），卡片里还嵌着第三种（清单卡的预览项）。
+  # 筛选必须同时限定「只看直接子元素」和「只动 .card」：
+  # 抓所有 li → 一按「清单」，清单卡自己的预览项会因为「type 不匹配」被整排隐藏；
+  # 抓所有顶层 li → 年份标记会被当成一张类型不匹配的卡，一按任何类型全部消失。
+  if grep -q '\[\.\.\.stream\.children\]' web/src/pages/index.astro &&
+     grep -q "classList\.contains('card')" web/src/pages/index.astro; then
+    ok "筛选只作用于顶层的 .card（预览项和年份标记都不会被连坐）"
   else
-    bad "筛选抓了所有 li —— 按类型筛选会把清单卡自己的预览项一起隐藏"
+    bad "筛选没有限定在顶层 .card —— 预览项会被连坐隐藏，年份标记会被当成卡片筛掉"
   fi
 else
   bad "清单/外链条目让构建失败了"
@@ -375,13 +378,120 @@ else
   bad "\.filters 的 display:flex 盖掉了 hidden，无 JS 时按钮显示但点不动"
 fi
 # 播报的数字是屏幕阅读器用户按下筛选钮后唯一的反馈，肉眼验收发现不了它错。
-if grep -q "querySelectorAll(':scope > li:not(\[hidden\])')" web/src/pages/index.astro; then
-  ok "筛选播报只数顶层卡（不把清单卡的预览项算进去）"
+if grep -q "querySelectorAll(':scope > li\.card:not(\[hidden\])')" web/src/pages/index.astro; then
+  ok "筛选播报只数顶层的 .card（预览项、年份标记都不算）"
 else
-  bad "筛选播报把清单卡的预览项也数进去了，读屏器听到的条数是错的"
+  bad "筛选播报数错了对象（清单卡的预览项或年份标记被算进去），读屏器听到的条数是错的"
 fi
 
-# ── 12. 构建失败时不能把已发布的产物留在半截状态 ──────────────────────────────
+# ── 12. 出口三件套：feed / sitemap / robots ─────────────────────────────────
+# feed 和 sitemap 是这个站主动**把 URL 递出去**的两个产物：一个群发给订阅者，
+# 一个直接交给搜索引擎。unlisted 的全部防护是「猜不到」，混进这两个文件里的话，
+# 页面上的 noindex 一点用都没有——路径已经在别人的库里了。
+# 所以这一组既断言「不该有的没有」，也断言「该有的有」：一个空文件同样能让前者通过。
+RAND3=$(openssl rand -hex 16)
+entry "$RAND3" '---
+title: ZZ_FEED_UNLISTED_TITLE
+type: note
+visibility: unlisted
+created: 2026-01-07
+---
+
+ZZ_FEED_UNLISTED_BODY'
+entry "$T-out" '---
+title: ZZ_OUT_TITLE 公开条目
+type: post
+visibility: public
+created: 2026-01-08
+---
+
+ZZ_OUT_BODY 这条应当出现在 feed 和 sitemap 里。'
+if build >/dev/null; then
+  feed=web/dist/feed.xml
+  smap=web/dist/sitemap.xml
+  robots=web/dist/robots.txt
+
+  if [ -f "$feed" ] && [ -f "$smap" ] && [ -f "$robots" ]; then
+    ok "feed.xml / sitemap.xml / robots.txt 都生成了"
+  else
+    bad "出口三件套缺文件（feed=$([ -f "$feed" ] && echo 有 || echo 无) sitemap=$([ -f "$smap" ] && echo 有 || echo 无) robots=$([ -f "$robots" ] && echo 有 || echo 无)）"
+  fi
+
+  # 合法 XML。手写 XML 的失败方式是「转义漏了一个字符 → 整份文档解析失败」，
+  # 而阅读器那边的表现是「这个源坏了」，肉眼看产物是看不出来的。
+  if python3 -c 'import sys,xml.etree.ElementTree as ET;[ET.parse(f) for f in sys.argv[1:]]' "$feed" "$smap" 2>/dev/null; then
+    ok "feed 与 sitemap 是合法 XML"
+  else
+    bad "feed 或 sitemap 解析失败（转义漏了字符的话，整份文档都用不了）"
+  fi
+
+  # 正例先立住：不然下面几条「不含 unlisted」的断言对一个空文件也成立。
+  if grep -qF "$T-out" "$feed" && grep -qF "$T-out" "$smap"; then
+    ok "public 条目进了 feed 与 sitemap"
+  else
+    bad "public 条目没进 feed/sitemap——下面几条「不含 unlisted」的断言因此不算数"
+  fi
+
+  if [ -f "web/dist/u/$RAND3/index.html" ]; then
+    for f in "$feed" "$smap"; do
+      for marker in "$RAND3" ZZ_FEED_UNLISTED_TITLE ZZ_FEED_UNLISTED_BODY; do
+        if grep -qF "$marker" "$f"; then bad "unlisted 的 '$marker' 出现在了 $(basename "$f") 里"; fi
+      done
+    done
+    ok "unlisted 的 id、标题、正文都不进 feed 与 sitemap（数据源是 publicEntries）"
+  else
+    bad "unlisted fixture 没构建出来，这一组的断言不算数"
+  fi
+
+  if grep -qF '/u/' "$smap"; then
+    bad "sitemap 里出现了 /u/——那是把猜不到的路径主动递给搜索引擎"
+  else
+    ok "sitemap 里没有任何 /u/ 路径"
+  fi
+
+  # feed 的条目数 == public 条目数。/e/ 下的目录是另一条独立算出来的答案
+  # （getStaticPaths 用的同样是 publicEntries），两边对不上就是漏了或多了谁。
+  n_feed=$(grep -c '<entry>' "$feed")
+  n_pub=$(find web/dist/e -mindepth 1 -maxdepth 1 -type d | wc -l)
+  if [ "$n_feed" -eq "$n_pub" ]; then
+    ok "feed 里 $n_feed 条 == public 条目数 $n_pub"
+  else
+    bad "feed 里 $n_feed 条，public 条目有 $n_pub 条"
+  fi
+
+  # robots.txt 的 Sitemap 行是搜索引擎找到 sitemap 的唯一入口。
+  if grep -q "^Sitemap: https\?://.*/sitemap\.xml$" "$robots"; then
+    ok "robots.txt 里有绝对 URL 的 Sitemap 行"
+  else
+    bad "robots.txt 缺 Sitemap 行（或不是绝对 URL）"
+  fi
+  # 这条反直觉，所以要有断言钉住，防止下一个人「顺手补上」：
+  # 禁止抓取 /u/ 会让爬虫取不到那一页，于是看不到页面上的 noindex，
+  # 而从别处（聊天预览、referrer）发现的链接反而可能被仅凭 URL 收录。
+  # noindex 要生效，前提是允许抓取。robots.txt 本身还是公开的——写上等于宣布秘密在哪。
+  if grep -qi 'Disallow: */u/' "$robots"; then
+    bad "robots.txt 里有 Disallow: /u/——爬虫取不到那页就看不到 noindex，反而更容易被仅凭 URL 收录"
+  else
+    ok "robots.txt 不禁止抓取 /u/（noindex 要生效，前提是允许抓取）"
+  fi
+
+  # /now/ 与 /e/now/ 是同一份内容的两个 URL。sitemap 是「我主动推荐哪一个」，
+  # 两个都推等于让搜索引擎自己挑，搜出来的很可能是那个没人认得的 /e/now/。
+  if [ -f web/dist/now/index.html ] && [ -d web/dist/e/now ]; then
+    if grep -qF '/e/now/' "$smap"; then
+      bad "sitemap 同时推荐了 /now/ 和 /e/now/（同一份内容的两个 URL）"
+    elif grep -qE '<loc>[^<]*/now/</loc>' "$smap"; then
+      ok "同一份内容的两个 URL 里，sitemap 只推荐 /now/"
+    else
+      bad "sitemap 里既没有 /now/ 也没有 /e/now/"
+    fi
+  fi
+else
+  bad "加了 feed/sitemap 的 fixture 让构建失败了"
+fi
+rm -f "$ENTRIES/$RAND3.md" "$ENTRIES/$T-out.md"
+
+# ── 13. 构建失败时不能把已发布的产物留在半截状态 ──────────────────────────────
 # scripts/publish 存在的理由：astro build 会先清空 outDir，而 outDir 就是线上 docroot。
 entry "$T-breaks-build" '---
 type: log
@@ -404,6 +514,644 @@ else
   ok "失败构建的正文没有进 web/dist"
 fi
 rm -f "$ENTRIES/$T-breaks-build.md"
+
+# ── 14. 标签页：只由公开条目聚出来 ────────────────────────────────────────────
+# 标签页和 feed / sitemap 是同一类东西：一个**猜得到的**页面，把一批条目的 URL 列出来。
+# `/t/读书/` 谁都能试，所以里面一旦混进一条 unlisted，它「猜不到」的防护就当场作废。
+# 这一组同样是正反都断言：一个空的标签页能让所有「不含 unlisted」的断言轻松通过。
+TAGENC=$(python3 -c "import urllib.parse;print(urllib.parse.quote('起居注'))")
+RAND4=$(openssl rand -hex 16)
+entry "$RAND4" '---
+title: ZZ_TAGU_TITLE
+type: note
+visibility: unlisted
+created: 2026-03-01
+tags: ["起居注", ZZTAGSECRET]
+---
+
+ZZ_TAGU_BODY'
+entry "$T-tag-a" '---
+title: ZZ_TAG_A 公开的带标签条目
+type: post
+visibility: public
+created: 2026-03-02
+tags: ["起居注", ZZUpperTag]
+---
+
+ZZ_TAG_A_BODY'
+entry "$T-tag-b" '---
+type: log
+visibility: public
+created: 2026-03-03
+tags: ["起居注"]
+---
+
+ZZ_TAG_B_BODY'
+if build >/dev/null; then
+  tpage="web/dist/t/起居注/index.html"
+  if [ -f "$tpage" ]; then
+    ok "中文标签生成了标签页（目录名是原文，链接里做百分号编码）"
+  else
+    bad "中文标签没有生成 /t/起居注/"
+  fi
+
+  # 正例先立住，理由同第 12 组：不然下面「不含 unlisted」的断言对一个空页面也成立。
+  if grep -qF "/e/$T-tag-a/" "$tpage" 2>/dev/null && grep -qF "/e/$T-tag-b/" "$tpage" 2>/dev/null; then
+    ok "标签页聚齐了这个标签下的公开条目"
+  else
+    bad "标签页漏了公开条目——下面几条「不含 unlisted」的断言因此不算数"
+  fi
+
+  # 同一条内容在首页和标签页上必须长得一样。两处版式不同是「完成度不高」最典型的症状，
+  # 而它不会有人报 bug——只会让人觉得这站是拼出来的。
+  if grep -q 'class="card" data-type=' "$tpage" 2>/dev/null; then
+    ok "标签页复用时间流的卡片"
+  else
+    bad "标签页没有用 .card——同一条内容在两个页面上长得不一样"
+  fi
+
+  hit=0
+  for marker in "$RAND4" ZZ_TAGU_TITLE ZZ_TAGU_BODY; do
+    if grep -rqF "$marker" web/dist/t 2>/dev/null; then
+      bad "unlisted 的 '$marker' 出现在了标签页里"; hit=1
+    fi
+  done
+  [ "$hit" -eq 0 ] && ok "unlisted 的 id、标题、正文都不出现在任何标签页里"
+
+  # 只有 unlisted 用过的标签**连页都不该有**：那一页上只可能是它，等于把它念出来。
+  if [ -e web/dist/t/zztagsecret ]; then
+    bad "只被 unlisted 用过的标签生成了标签页——那一页上只可能有它"
+  else
+    ok "只被 unlisted 用过的标签不生成标签页"
+  fi
+  n=$(grep -rlF ZZTAGSECRET web/dist 2>/dev/null | wc -l)
+  if [ "$n" -eq 1 ]; then
+    ok "unlisted 的标签只出现在它自己那一页"
+  else
+    bad "unlisted 的标签出现在 $n 个产物里，应当只有 1 个"
+  fi
+
+  # 条目页链出去时必须编码。漏掉不会立刻露馅：地址栏里中文照样能打开，
+  # 但标签里要是有个 # 或 ?，链接会静静地指向别处。
+  if grep -qF "class=\"tag\" href=\"/t/$TAGENC/\"" "web/dist/e/$T-tag-a/index.html" 2>/dev/null; then
+    ok "条目页把标签链到 /t/，中文做了百分号编码"
+  else
+    bad "条目页没有链到 /t/（或者没做百分号编码）"
+  fi
+
+  # 大小写归一：ZZUpperTag 和 zzuppertag 是同一个标签，分成两页等于标签没起作用。
+  if [ -e web/dist/t/zzuppertag ] && grep -qF 'href="/t/zzuppertag/"' "web/dist/e/$T-tag-a/index.html" 2>/dev/null; then
+    ok "标签的大小写归一（Go 和 go 落在同一页）"
+  else
+    bad "标签没有归一到小写，同一个词会分成两页"
+  fi
+
+  # 未列出页上的标签：有页的链出去（单向，泄露不了什么），没页的退化成纯文字而不是死链。
+  upage="web/dist/u/$RAND4/index.html"
+  if grep -qF 'href="/t/zztagsecret' "$upage" 2>/dev/null; then
+    bad "未列出页链向一个不存在的标签页"
+  elif grep -qF ZZTAGSECRET "$upage" 2>/dev/null; then
+    ok "未列出页上没有标签页的那个标签退化成纯文字"
+  else
+    bad "未列出页上没有渲染出标签"
+  fi
+else
+  bad "带标签的条目让构建失败了"
+fi
+rm -f "$ENTRIES/$RAND4.md" "$ENTRIES/$T-tag-a.md" "$ENTRIES/$T-tag-b.md"
+
+# ── 15. 标签的形状：路由参数就是目录名，不能让它跑到 /t/ 外面去 ────────────────
+# tags 没有任何形状校验（server/write.go 只做 YAML 转义），而 getStaticPaths 的参数
+# 会直接变成 dist 下的路径。`..` 那一条最狠：/t/../index.html 正好盖掉首页。
+entry "$T-tag-space" '---
+type: log
+visibility: public
+created: 2026-03-04
+tags: ["标签 带空格"]
+---
+
+ZZ_TAGSPACE_BODY'
+if build >/dev/null; then
+  if [ -d "web/dist/t/标签-带空格" ]; then
+    ok "带空格的标签折成 - 之后仍是一个合法路径段"
+  else
+    bad "带空格的标签没生成出 /t/标签-带空格/"
+  fi
+else
+  bad "带空格的标签让构建失败了——它应当被折成 -，不是被拒绝"
+fi
+rm -f "$ENTRIES/$T-tag-space.md"
+
+i=0
+# `a/b` 现在不在这一批里：tagSlug 会把除字母数字中文以外的字符折成 `-`，
+# 于是它变成 `a-b`，是一个完全正常的标签。剩下这两个折完之后什么都不剩，
+# 做不出 URL 里的一段，只能大声失败。
+for badtag in '".."' '"   "'; do
+  i=$((i + 1))
+  name="$T-tagbad-$i"
+  entry "$name" "---
+type: log
+visibility: public
+created: 2026-03-05
+tags: [$badtag]
+---
+
+ZZ_TAGBAD_BODY"
+  if out=$(build); then
+    bad "标签 $badtag 居然构建通过了——它会让产物落在 /t/ 之外"
+  elif ! grep -qF "$name" <<<"$out"; then
+    bad "标签 $badtag 让构建失败了，但没说清是哪一条"
+  else
+    ok "标签 $badtag 让构建失败，并指出是哪一条"
+  fi
+  rm -f "$ENTRIES/$name.md"
+done
+# 反过来：含 `/`、`#`、`&` 这类字符的标签**不该**失败，它们会被折成安全的 slug。
+# 关键是折完之后产物仍然落在 /t/ 里面——这是 tagSlug 存在的全部理由。
+entry "$T-tagfold" '---
+type: log
+visibility: public
+created: 2026-03-06
+tags: ["a/b", "前端 & 后端"]
+---
+
+ZZ_TAGFOLD_BODY'
+if build >/dev/null; then
+  if [ -d web/dist/t/a-b ] && [ -d "web/dist/t/前端-后端" ]; then
+    ok "含 / 和 & 的标签被折成安全 slug，产物落在 /t/ 内"
+  else
+    bad "折叠后的标签页没有落在 /t/a-b/ 和 /t/前端-后端/：$(ls web/dist/t 2>/dev/null | tr '\n' ' ')"
+  fi
+else
+  bad "含 / 的标签让构建失败了——它应当被折成 a-b，而不是被拒绝"
+fi
+rm -f "$ENTRIES/$T-tagfold.md"
+
+if [ -e t ] || [ -e web/t ]; then
+  bad "构建在 dist 外面写出了 t/ 目录"
+else
+  ok "非法标签没有在 dist 外面写出任何东西"
+fi
+
+# ── 16. 上下篇：条目页不能是死胡同，但 /u/ 上一条都不能有 ─────────────────────
+# 前半是可用性，后半是安全性质，放在一起是因为它们是同一段代码的两面：
+# /e/ 上有上下篇是对的，/u/ 上有就等于把整批未列出条目串成一条链——
+# 我发出去一条链接，对方顺着点就拿到了全部。
+RAND5=$(openssl rand -hex 16)
+RAND6=$(openssl rand -hex 16)
+entry "$T-nav-new" '---
+title: ZZ_NAV_NEW 最新的一条
+type: post
+visibility: public
+created: 2099-01-02
+---
+
+ZZ_NAV_NEW_BODY'
+entry "$T-nav-mid" '---
+title: ZZ_NAV_MID 中间那条
+type: log
+visibility: public
+created: 2099-01-01
+---
+
+ZZ_NAV_MID_BODY'
+entry "$T-nav-old" '---
+title: ZZ_NAV_OLD 最旧的一条
+type: note
+visibility: public
+created: 1990-01-01
+---
+
+ZZ_NAV_OLD_BODY'
+entry "$RAND5" '---
+title: ZZ_NAV_U1
+type: log
+visibility: unlisted
+created: 2099-01-03
+---
+
+ZZ_NAV_U1_BODY'
+entry "$RAND6" '---
+title: ZZ_NAV_U2
+type: log
+visibility: unlisted
+created: 1990-01-02
+---
+
+ZZ_NAV_U2_BODY'
+if build >/dev/null; then
+  newpage="web/dist/e/$T-nav-new/index.html"
+  midpage="web/dist/e/$T-nav-mid/index.html"
+  oldpage="web/dist/e/$T-nav-old/index.html"
+
+  # 最新那条的「更旧的」指向 mid，而 new 是 post、mid 是 log——上下篇跨 type 串，
+  # 不按 type 分组：首页就是一条混合流，从那里点进来的人期待的下一条就是流里的下一条。
+  if grep -qF "rel=\"next\" href=\"/e/$T-nav-mid/\"" "$newpage" 2>/dev/null; then
+    ok "条目页有「更旧的」链接，且跨 type 串（post → log）"
+  else
+    bad "条目页没有指向流里下一条的链接"
+  fi
+  if grep -q 'rel="prev"' "$newpage" 2>/dev/null; then
+    bad "最新的一条居然有「更新的」链接"
+  else
+    ok "最新的一条没有「更新的」"
+  fi
+  if grep -q 'rel="prev"' "$oldpage" 2>/dev/null && ! grep -q 'rel="next"' "$oldpage" 2>/dev/null; then
+    ok "最旧的一条只有「更新的」，没有「更旧的」"
+  else
+    bad "最旧的一条的上下篇不对（应当只有「更新的」）"
+  fi
+  if grep -q 'rel="prev"' "$midpage" 2>/dev/null && grep -q 'rel="next"' "$midpage" 2>/dev/null; then
+    ok "中间的条目两头都有"
+  else
+    bad "中间的条目缺了一头"
+  fi
+
+  u1="web/dist/u/$RAND5/index.html"
+  u2="web/dist/u/$RAND6/index.html"
+  if grep -qE 'class="pager"|rel="(prev|next)"' "$u1" 2>/dev/null || grep -qE 'class="pager"|rel="(prev|next)"' "$u2" 2>/dev/null; then
+    bad "未列出页上有上下篇——拿到一条链接的人能顺着点完全部未列出条目"
+  else
+    ok "未列出页上没有上下篇"
+  fi
+  if grep -qF "$RAND6" "$u1" 2>/dev/null || grep -qF "$RAND5" "$u2" 2>/dev/null; then
+    bad "一条未列出条目的页面里出现了另一条的 id"
+  else
+    ok "未列出条目之间互不引用（一条链接只换一条内容）"
+  fi
+else
+  bad "上下篇的 fixture 让构建失败了"
+fi
+rm -f "$ENTRIES/$T-nav-new.md" "$ENTRIES/$T-nav-mid.md" "$ENTRIES/$T-nav-old.md" \
+      "$ENTRIES/$RAND5.md" "$ENTRIES/$RAND6.md"
+
+# ── 17. head 里的分享与发现：OG、图标、订阅入口 ──────────────────────────────
+# 这三样都不会有人报 bug，只会让人觉得这站没做完：分享到微信 / Telegram / Slack 是
+# 一行裸 URL 而不是一张卡、标签页上是空白图标（外加每次访问一条 /favicon.ico 的 404）、
+# 阅读器发现不了 feed。而它们全在 <head> 里——肉眼验收永远看不到那一段。
+RAND7=$(openssl rand -hex 16)
+entry "$T-head" '---
+title: ZZ_HEAD_TITLE 一条长文
+type: post
+visibility: public
+created: 2026-04-01
+---
+
+ZZ_HEAD_BODY 这条用来看条目页的 head。'
+entry "$RAND7" '---
+title: ZZ_HEAD_U_TITLE
+type: log
+visibility: unlisted
+created: 2026-04-02
+---
+
+ZZ_HEAD_U_BODY'
+if build >/dev/null; then
+  home=web/dist/index.html
+  page="web/dist/e/$T-head/index.html"
+  upage="web/dist/u/$RAND7/index.html"
+
+  miss=""
+  for m in 'property="og:type"' 'property="og:title"' 'property="og:description"' \
+           'property="og:url"' 'property="og:site_name"' 'name="twitter:card" content="summary"'; do
+    grep -qF "$m" "$home" || miss="$miss $m"
+  done
+  if [ -z "$miss" ]; then ok "首页 head 里 og:* 与 twitter:card 齐全"
+  else bad "首页 head 缺:$miss"; fi
+
+  # 抓取端拿到的是这一段 HTML，不是浏览器的地址栏——相对地址它拼不出绝对 URL。
+  if grep -qF 'property="og:url" content="https://' "$home"; then
+    ok "og:url 是绝对 URL"
+  else
+    bad "og:url 不是绝对 URL（抓取端拼不出来）"
+  fi
+
+  # 全站一律 website 的话，抓取端分不出「这是一个站」和「这是站上的一条东西」。
+  if grep -qF 'property="og:type" content="article"' "$page" 2>/dev/null &&
+     grep -qF 'property="og:type" content="website"' "$home"; then
+    ok "条目页 og:type=article，首页 og:type=website"
+  else
+    bad "og:type 没有按页面分（条目页应当是 article）"
+  fi
+
+  # 标题必须跟着页面走。整站一个标题的 OG 比没有 OG 更糟：每条分享出去都长得一样。
+  if grep -qF 'property="og:title" content="ZZ_HEAD_TITLE 一条长文 · cairn"' "$page" 2>/dev/null; then
+    ok "og:title 跟着这一页的标题走"
+  else
+    bad "条目页的 og:title 不是这一条的标题"
+  fi
+
+  if grep -qF 'rel="icon" type="image/svg+xml" href="data:image/svg+xml,' "$home"; then
+    ok "favicon 是内联 SVG 的 data URI（零文件、零请求）"
+  else
+    bad "head 里没有内联 SVG 图标"
+  fi
+
+  # 站徽的几何只写一遍（Base.astro 里的 STONES），页眉那块图和标签页图标同源。
+  # 各画各的话，改了一处另一处不会报任何错，站徽就悄悄变成两个标志——
+  # 而这正是「同一个东西在两处长得不一样」里最不容易发现的一种。
+  # 页眉是 inline <svg>（原文），favicon 是 data URI（编码过），所以两边分开数。
+  if grep -qF 'x="12.6" y="3.2"' "$home" && grep -qF 'x%3D%2212.6%22%20y%3D%223.2%22' "$home"; then
+    ok "页眉字标和 favicon 画的是同一堆石头"
+  else
+    bad "页眉的站徽和 favicon 不是同一个图形（几何被抄成了两份）"
+  fi
+
+  if grep -qF 'rel="alternate" type="application/atom+xml"' "$home"; then
+    ok "head 里有 feed 的 rel=alternate（阅读器唯一的发现入口）"
+  else
+    bad "head 里没有指向 feed.xml 的 rel=alternate"
+  fi
+
+  # unlisted 页面**照样**有 og：og:url 就是这一页自己的地址，而拿得到这一页的人
+  # 手里本来就有它（不然打不开）。真正把秘密递出去的是「猜得到的页面列出别人的 URL」，
+  # og 不属于那一类。但两件事互不替代——noindex 必须还在，随机路径也不能因为
+  # 多了这几行标签就漏进任何别的产物。
+  if grep -q 'name="robots" content="noindex, nofollow"' "$upage" 2>/dev/null &&
+     grep -qF "property=\"og:url\" content=\"https://example.com/u/$RAND7/\"" "$upage" 2>/dev/null; then
+    ok "未列出页有 og，但 noindex 仍在，且 og:url 就是它自己"
+  else
+    bad "未列出页的 og / noindex 不对"
+  fi
+  hits=$(grep -rlF "$RAND7" web/dist 2>/dev/null | wc -l)
+  if [ "$hits" -eq 1 ]; then
+    ok "加了 og 之后，unlisted 的路径仍然只出现在它自己那一页"
+  else
+    bad "unlisted 的路径出现在 $hits 个产物里，应当只有 1 个"
+  fi
+else
+  bad "head 那一组的 fixture 让构建失败了"
+fi
+rm -f "$ENTRIES/$T-head.md" "$ENTRIES/$RAND7.md"
+
+# ── 18. 影像卡：图要真的出现，而且不能是抠出来的裸相对路径 ────────────────────
+# photo 是六型里唯一「内容就是那张图」的一支，而卡片上原先从不出现图像。
+# 这一组同时钉住两头：绝对路径 / 远程图要铺出来，相对路径**必须**被丢掉——
+# 卡片上的 src 是从正文原文正则抠出来的，一个字都没经过 Astro 的图片管线，
+# 相对路径印出去就是一张 404 的坏图（见 entries.ts 的 firstImage）。
+PIC="$ENTRIES/$T-pic.png"
+MADE+=("$PIC")
+# 一张 1×1 PNG。只是给相对路径一个真实的落点：Astro 的图片管线遇到指不到文件的
+# 相对路径会直接让构建失败，那样这条 fixture 测的就不是它该测的东西了。
+printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==' | base64 -d > "$PIC"
+entry "$T-photo" '---
+title: ZZ_PHOTO_TITLE
+type: photo
+visibility: public
+created: 2026-05-02
+---
+
+![ZZ_SHOT_ALT](/zz-shot-abs.png)
+
+ZZ_PHOTO_TAIL'
+entry "$T-photo-rel" "---
+title: ZZ_PHOTOREL_TITLE
+type: photo
+visibility: public
+created: 2026-05-01
+---
+
+![ZZ_RELALT](./$T-pic.png)"
+RAND8=$(openssl rand -hex 16)
+entry "$RAND8" '---
+title: ZZ_UPHOTO_TITLE
+type: photo
+visibility: unlisted
+created: 2026-05-03
+---
+
+![ZZ_UPHOTO_ALT](/zz-unlisted-shot.png)'
+if build >/dev/null; then
+  home=web/dist/index.html
+
+  if grep -qF '<div class="shot">' "$home" && grep -qF 'src="/zz-shot-abs.png"' "$home"; then
+    ok "影像卡上真的有 <img>（绝对路径的图）"
+  else
+    bad "影像卡上没有图——photo 是唯一「内容就是那张图」的一支"
+  fi
+  # 抠出来的是裸 src，没有宽高，位置只能由 CSS 预留。少了 aspect-ratio，
+  # 图一到就把它下面所有的卡往下顶——一次滚动里连跳好几次。
+  # aspect-ratio 断在源码上：产物里的 CSS 是压过的，写法随打包器的版本变。
+  if grep -qF 'loading="lazy"' "$home" &&
+     grep -qF 'aspect-ratio: 3 / 2' web/src/styles/global.css; then
+    ok "图有 loading=lazy，且 CSS 用 aspect-ratio 预留了位置"
+  else
+    bad "图缺 loading=lazy 或没预留位置——图一到就会把下面所有卡往下顶"
+  fi
+
+  n=$(grep -o 'class="shot"' "$home" | wc -l)
+  if [ "$n" -eq 1 ]; then
+    ok "相对路径的图不上卡片（只有绝对路径那一张铺了出来）"
+  else
+    bad "首页上有 $n 张卡片图，应当只有 1 张（相对路径那条不该铺）"
+  fi
+  if grep -qF "$T-pic.png" "$home"; then
+    bad "裸相对路径被印进了首页的 <img src>——那是一张 404 的坏图"
+  else
+    ok "裸相对路径一个字都没进首页"
+  fi
+  # 反过来立住：相对图本身是好的，条目页上它走 <Content /> 进了 Astro 的图片管线。
+  # 少了这一条，上面两句对「图根本没生成」也成立。
+  if grep -qE '<img[^>]+src="/_astro/' "web/dist/e/$T-photo-rel/index.html" 2>/dev/null; then
+    ok "同一张相对图在条目页上是好的（走图片管线，src 指向 /_astro/）"
+  else
+    bad "相对图在条目页上也没渲染出来——这组断言因此不算数"
+  fi
+
+  # 图上面印一遍说明、下面再把同一句当摘要印一遍，是这版之前首页最难看的那种重复。
+  if grep -qF 'ZZ_SHOT_ALT' "$home"; then
+    bad "有图的影像卡还把 alt 当摘要印了一遍"
+  else
+    ok "有图时不再把 alt 当摘要渲染一遍"
+  fi
+
+  # 卡片图是一类新产物：它把一个 URL 印在一个猜得到的页面上。
+  # unlisted 的图只能出现在它自己那一页。
+  hits=$(grep -rlF '/zz-unlisted-shot.png' web/dist 2>/dev/null | wc -l)
+  if [ "$hits" -eq 1 ]; then
+    ok "unlisted 影像的图只出现在它自己那一页"
+  else
+    bad "unlisted 影像的图出现在 $hits 个产物里，应当只有 1 个"
+  fi
+else
+  bad "影像 fixture 让构建失败了"
+fi
+rm -f "$ENTRIES/$T-photo.md" "$ENTRIES/$T-photo-rel.md" "$ENTRIES/$RAND8.md" "$PIC"
+
+# ── 19. 目录：只给够长的长文 ─────────────────────────────────────────────────
+# 一条短记加目录是笑话，一篇两节的文章加目录也是——目录比它省下的翻页还长。
+entry "$T-toc" '---
+title: ZZ_TOC_TITLE
+type: post
+visibility: public
+created: 2026-06-03
+---
+
+开头一段。
+
+## ZZTOCONE
+
+一段。
+
+## ZZTOCTWO
+
+一段。
+
+### ZZTOCSUB
+
+一段。
+
+#### ZZTOCDEEP
+
+一段。'
+entry "$T-toc-short" '---
+title: ZZ_TOCSHORT_TITLE
+type: post
+visibility: public
+created: 2026-06-02
+---
+
+## ZZSHORTA
+
+一段。
+
+## ZZSHORTB
+
+一段。'
+entry "$T-toc-note" '---
+title: ZZ_TOCNOTE_TITLE
+type: note
+visibility: public
+created: 2026-06-01
+---
+
+## ZZNOTEA
+
+一段。
+
+## ZZNOTEB
+
+一段。
+
+## ZZNOTEC
+
+一段。'
+if build >/dev/null; then
+  long="web/dist/e/$T-toc/index.html"
+  if grep -qF 'class="toc"' "$long" 2>/dev/null &&
+     grep -qF 'href="#zztocone"' "$long" &&
+     grep -qF 'href="#zztoctwo"' "$long" &&
+     grep -qF 'href="#zztocsub"' "$long"; then
+    ok "三节以上的长文有目录，h2/h3 都在里面"
+  else
+    bad "长文没有目录（或漏了 h2/h3）"
+  fi
+  # h4 多半是列举，铺进来目录会比正文的骨架还碎。锚点只有目录会生成，所以这样判得准。
+  if grep -qF 'href="#zztocdeep"' "$long" 2>/dev/null; then
+    bad "目录收了 h4——那一层是列举，不是骨架"
+  else
+    ok "目录只收 h2/h3，不收更深的层级"
+  fi
+  if grep -qF 'class="toc"' "web/dist/e/$T-toc-short/index.html" 2>/dev/null; then
+    bad "只有两节的长文也加了目录"
+  else
+    ok "只有两节的长文不加目录"
+  fi
+  if grep -qF 'class="toc"' "web/dist/e/$T-toc-note/index.html" 2>/dev/null; then
+    bad "非 post 的条目加了目录——一条笔记 / 短记加目录是笑话"
+  else
+    ok "只有 post 才有目录"
+  fi
+else
+  bad "目录 fixture 让构建失败了"
+fi
+rm -f "$ENTRIES/$T-toc.md" "$ENTRIES/$T-toc-short.md" "$ENTRIES/$T-toc-note.md"
+
+# ── 20. 年份标记：时间锚点，而且不能被时区带偏、不能干扰筛选 ──────────────────
+# 这一组**故意在 UTC 以西的时区构建**。frontmatter 里的 created 是纯日期，
+# z.coerce.date() 按 UTC 午夜解析——用 getFullYear() 的话，`2097-01-01` 在洛杉矶
+# 会被读成 2096，于是构建机器换个时区首页就凭空少一个年份，而卡片上的日期还写着 2097。
+# entries.ts 的 formatDate 早就因为同一个理由用 getUTC*，两处必须一致。
+entry "$T-yr-new" '---
+title: ZZ_YR_NEW
+type: log
+visibility: public
+created: 2098-06-01
+---
+
+ZZ_YR_NEW_BODY'
+entry "$T-yr-jan" '---
+title: ZZ_YR_JAN
+type: log
+visibility: public
+created: 2097-01-01
+---
+
+ZZ_YR_JAN_BODY'
+entry "$T-yr-old" '---
+title: ZZ_YR_OLD
+type: log
+visibility: public
+created: 2096-06-01
+---
+
+ZZ_YR_OLD_BODY'
+if (cd web && TZ=America/Los_Angeles npm run build) >/dev/null 2>&1; then
+  home=web/dist/index.html
+  miss=""
+  for y in 2098 2097 2096; do
+    grep -qF "aria-hidden=\"true\"><span>$y</span>" "$home" || miss="$miss $y"
+  done
+  if [ -z "$miss" ]; then
+    ok "年份标记出现了，且在 UTC 以西的时区里不跑偏（getUTCFullYear）"
+  else
+    bad "缺年份标记:$miss（用 getFullYear 的话 2097-01-01 在洛杉矶会被读成 2096）"
+  fi
+  if grep -qF '>2097-01-01<' "$home"; then
+    ok "卡片上的日期和年份标记同源（都按 UTC 取）"
+  else
+    bad "卡片日期和年份标记对不上——机器读到的和人看到的不一致"
+  fi
+
+  # 一年一个标记，不是一条一个。真实内容里 2026 年有好几条，
+  # 「每张卡都插一个」这个 bug 只有在这里才看得出来。
+  n=$(grep -o '><span>2026</span>' "$home" | wc -l)
+  if [ "$n" -eq 1 ]; then
+    ok "同一年只插一个标记（不是每张卡一个）"
+  else
+    bad "2026 年出现了 $n 个年份标记，应当只有 1 个"
+  fi
+
+  # aria-hidden：每张卡自己带完整日期，年份是给眼睛扫读的锚点。留在无障碍树里的话，
+  # 读屏器会在列表中间念出一串裸年份，还会让「共 N 项」和筛选播报的条数对不上。
+  if grep -qF '<li class="yearmark" aria-hidden="true">' "$home"; then
+    ok "年份标记对读屏器隐藏（列表项数仍等于卡片数）"
+  else
+    bad "年份标记没有 aria-hidden，会被当成一条内容念出来"
+  fi
+else
+  bad "年份 fixture 在 TZ=America/Los_Angeles 下让构建失败了"
+fi
+rm -f "$ENTRIES/$T-yr-new.md" "$ENTRIES/$T-yr-jan.md" "$ENTRIES/$T-yr-old.md"
+
+# 年份标记是顶层 <li>，会落进筛选脚本手里——第 8、11 组已经钉住「筛选只动 .card」。
+# 这里补最后一环：它自己被隐藏时得真的消失。和 .filters 同一个坑，
+# 作者样式里的 display:flex 无论特异性高低都会赢 UA 的 [hidden]{display:none}，
+# 少了这一条，筛选之后「底下一张卡都不剩」的年份标记照样浮在那儿。
+if grep -q "\.yearmark\[hidden\] { display: none; }" web/src/styles/global.css; then
+  ok "年份标记的 hidden 真的生效（筛空的年份会消失）"
+else
+  bad "\.yearmark 的 display:flex 盖掉了 hidden，筛完会留下底下没有卡片的年份"
+fi
+
+# 上一条只钉住了 CSS 里有那条规则。JS 有没有真的去设那个 hidden 是另一回事——
+# 实测把 `marker.hidden = !kept` 改成 `marker.hidden = false` 时全套断言依然全绿，
+# 而线上表现是「按文章筛完，一个底下一张卡都没有的年份还浮在那儿」。
+if grep -q "marker.hidden = !kept" web/src/pages/index.astro; then
+  ok "年份标记会跟着它底下还剩几张卡一起隐藏"
+else
+  bad "筛选脚本没把年份标记的 hidden 记账进去，筛空的年份会留在页面上"
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then

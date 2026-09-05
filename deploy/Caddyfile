@@ -14,6 +14,11 @@ example.com {
 		reverse_proxy 127.0.0.1:8787
 	}
 
+	# feed.xml 是构建产出的静态文件，由 Caddy 按自己的 mime 表发（.xml → text/xml）。
+	# feed.xml.ts 里那行 Content-Type 只在 dev / SSR 生效，线上不算数——要设只能在这里。
+	@feed path /feed.xml
+	header @feed Content-Type "application/atom+xml; charset=utf-8"
+
 	# unlisted 靠「搜不到」，兜底再挡一层爬虫。
 	@unlisted path /u/*
 	header @unlisted X-Robots-Tag "noindex, nofollow"
@@ -22,5 +27,29 @@ example.com {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		X-Content-Type-Options "nosniff"
 		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
+	# file_server 找不到文件时不会自己去用 404.html——没有这一段的话，
+	# web/src/pages/404.astro 构建出来的 dist/404.html 永远发不出去，
+	# 线上 404 是 Caddy 自带的空白页。这是错误路由，和上面那条主路由是两套。
+	handle_errors {
+		# 只有 404 才发那一页。Go 服务没起来时 reverse_proxy 会报 502，
+		# 那种情况回一张「没有这一页」是在撒谎——把「服务挂了」说成「地址输错了」，
+		# 而这两件事该做的处置完全相反。所以先按状态码分流。
+		@404 expression {err.status_code} == 404
+		handle @404 {
+			root * /srv/cairn/web/dist
+			rewrite * /404.html
+			# 必须显式写回 404。file_server 发一个存在的文件是 200，
+			# 于是「找不到」会以 200 发出去（soft 404）——搜索引擎会把它当正文收录，
+			# 而 unlisted 那套「猜不到」的防护，前提正是猜错时得到的是明确的否定。
+			file_server {
+				status 404
+			}
+		}
+		# 其余照实回。不套模板、不猜 Content-Type：502/503 的读者是 curl 和监控，
+		# 不是人。/api/* 和 /circle/* 只有在**连不上** Go 服务时才会走到这里——
+		# 上游自己返回的 401 / 501 是正常响应，reverse_proxy 原样透传，不进错误路由。
+		respond "{err.status_code} {err.status_text}" {err.status_code}
 	}
 }

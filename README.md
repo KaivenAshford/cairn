@@ -68,4 +68,8 @@ scripts/test-visibility       # 构建侧：private 混入公开目录会失败�
 cd web && npm test            # astro check + build
 ```
 
+这三套在 GitHub Actions 上每次 push 与 PR 都跑一遍（`.github/workflows/ci.yml`）——
+断言只在本地跑，就还是「靠记得」。CI 上没有内容目录（真实条目在另一个 private 仓库），
+所以流水线先跑 `scripts/seed` 灌 fixtures 再测。
+
 给 Claude Code 的项目上下文在 [CLAUDE.md](CLAUDE.md)。

@@ -1,18 +1,54 @@
 ---
 import { render } from 'astro:content';
 import Base from '../../layouts/Base.astro';
-import { publicEntries, displayTitle, excerpt, formatDate, TYPE_LABEL, type Entry } from '../../lib/entries';
+import { publicEntries, displayTitle, excerpt, formatDate, tagHref, TYPE_LABEL, type Entry } from '../../lib/entries';
+
+/** 上下篇只需要这两样。 */
+interface Neighbor { id: string; title: string }
 
 export async function getStaticPaths() {
   const entries = await publicEntries();
-  return entries.map((entry) => ({ params: { id: entry.id }, props: { entry } }));
+
+  // 上下篇**跨 type 串**，不按 type 分组：首页就是一条混合时间流，读者是从那条流里
+  // 点进来的，「下一条」理应还是流里的下一条。按 type 分组的话，读完一条短记点「更旧的」
+  // 会跳到三个月前——因为中间那十几条都是别的类型，而读者根本不知道自己被分组了。
+  //
+  // 只传 id 和标题，不传整条 entry：这块 markup 需要的就这两样。
+  // 把整条传下去，等于让「上下篇」随时能长出摘要、正文、标签，而它只该是一条链接。
+  const nav = (e: Entry | undefined): Neighbor | null =>
+    e ? { id: e.id, title: displayTitle(e) } : null;
+
+  // entries 已经是按 created 倒序，所以下标小的更新、下标大的更旧。
+  return entries.map((entry, i) => ({
+    params: { id: entry.id },
+    props: { entry, newer: nav(entries[i - 1]), older: nav(entries[i + 1]) },
+  }));
 }
 
-const { entry } = Astro.props as { entry: Entry };
-const { Content } = await render(entry);
+const { entry, newer, older } = Astro.props as {
+  entry: Entry;
+  newer: Neighbor | null;
+  older: Neighbor | null;
+};
+const { Content, headings } = await render(entry);
+
+/**
+ * 目录。headings 是 Astro 渲染 markdown 时顺手给的（depth / slug / text），
+ * 不自己解析正文——正则解析 markdown 标题会把代码块里的 `# 注释` 也当成一节，
+ * 而 Astro 给的这份和页面上真实生成的 id 是同一个来源，锚点不会指空。
+ *
+ * **只给 post，而且只在够长的时候给。** 一条短记加目录是笑话；一篇只有两节的文章
+ * 加目录也是——目录比它省下的翻页还长。门槛定在「depth 2–3 的标题 ≥ 3 个」。
+ * 不收 h4 及更深：那一层多半是列举，铺进来目录会比正文的骨架更碎。
+ * h1 也不收，它就是页面标题本身。
+ */
+const toc = entry.data.type === 'post'
+  ? headings.filter((h) => h.depth >= 2 && h.depth <= 3)
+  : [];
+const showToc = toc.length >= 3;
 ---
 
-<Base title={displayTitle(entry)} description={excerpt(entry, 140)}>
+<Base title={displayTitle(entry)} description={excerpt(entry, 140)} ogType="article">
   {/* data-type 是这一版唯一新增的 markup：条目页的顶端色条、淡底、h3 着色、引用竖线
       全部从 :root 里那张「type → 颜色」映射表取值，靠的就是这个属性。少了它，
       从时间流点进来颜色会突然消失，「同一个东西打开了」这层连续性就断了。 */}
@@ -23,7 +59,49 @@ const { Content } = await render(entry);
       {' '}<time datetime={entry.data.created.toISOString()}>{formatDate(entry.data.created)}</time>
       {entry.data.updated && <> · 更新于 {formatDate(entry.data.updated)}</>}
       {entry.data.status === 'seed' && <> · <span class="seed">种子，还没想清楚</span></>}
+      {/* href 一律走 tagHref：它管百分号编码。这个站的标签基本都是中文，
+          直接把原文拼进 href 的话，`C#` 那种带 # 的标签会静静地指向别处。 */}
+      {entry.data.tags.length > 0 && (
+        <span class="tags">
+          {entry.data.tags.map((t) => <a class="tag" href={tagHref(t)}>#{t}</a>)}
+        </span>
+      )}
     </div>
+    {showToc && (
+      /* 标题用 <p> 而不是 <h2>：这一页的标题结构是文章自己的那几节，
+         给目录也发一个 h2，读屏器按标题跳转时就会多出一站，而它不是内容。
+         nav 的可访问名靠 aria-labelledby 指过来，念出来的仍然是「目录」。 */
+      <nav class="toc" aria-labelledby="toc-h">
+        <p class="toc-h" id="toc-h">目录</p>
+        <ol>
+          {toc.map((h) => (
+            <li data-depth={h.depth}><a href={`#${h.slug}`}>{h.text}</a></li>
+          ))}
+        </ol>
+      </nav>
+    )}
+
     <Content />
   </article>
+
+  {/* 条目页原先是条死胡同：读完一条短记只要十秒，然后只能按后退。
+      写「更新的 / 更旧的」而不是「上一篇 / 下一篇」，两个理由：
+      一是「上」在倒序时间流上是歧义的——一半人以为是时间更早的，一半人以为是列表更靠上的，
+      而这两个方向正好相反；二是这个站的条目大多不是「篇」，一条短记谈不上篇。 */}
+  {(newer || older) && (
+    <nav class="pager" aria-label="相邻条目">
+      {newer && (
+        <a class="prev" rel="prev" href={`/e/${newer.id}/`}>
+          <span class="dir">← 更新的一条</span>
+          <span class="title">{newer.title}</span>
+        </a>
+      )}
+      {older && (
+        <a class="next" rel="next" href={`/e/${older.id}/`}>
+          <span class="dir">更旧的一条 →</span>
+          <span class="title">{older.title}</span>
+        </a>
+      )}
+    </nav>
+  )}
 </Base>

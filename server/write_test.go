@@ -605,6 +605,50 @@ func TestConfigRefusesToRunUnsafely(t *testing.T) {
 	}
 }
 
+// 标签会变成 /t/<slug>/ 的目录名。做不出 slug 的标签必须当场拒掉——
+// 落盘之后再由构建大声失败，代价是整站停更到有人手改那个文件。
+func TestRejectsUnusableTags(t *testing.T) {
+	h := newHarness(t)
+	for _, tag := range []string{"..", ".", "   ", "///", "!!!", "#", ""} {
+		body, _ := json.Marshal(map[string]any{
+			"text": "x", "visibility": "public", "tags": []string{tag},
+		})
+		if w := h.post(string(body)); w.Code != http.StatusBadRequest {
+			t.Errorf("标签 %q 返回 %d，想要 400（body=%s）", tag, w.Code, w.Body.String())
+		}
+	}
+	// 能做出 slug 的照常放行，中文和带空格的都算数
+	for i, tag := range []string{"tsgo", "读书 笔记", "C#", "前端 & 后端"} {
+		resp := h.write(t, map[string]any{
+			"text": "x", "visibility": "public", "tags": []string{tag},
+			"id": fmt.Sprintf("tagok-%d", i),
+		})
+		if fm := fmOf(t, h, resp.Path); len(fm.Tags) != 1 || fm.Tags[0] != tag {
+			t.Errorf("标签 %q 没有原样落盘，得到 %v", tag, fm.Tags)
+		}
+	}
+}
+
+// tagSlug 必须和 web/src/lib/entries.ts 里那个同名函数产出一样的结果。
+// 两边不一致的后果是「服务端放行、构建失败」——最难查的那种不一致。
+func TestTagSlugMatchesFrontend(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"tsgo", "tsgo"},
+		{"C#", "c"},
+		{"C++", "c"},
+		{"读书 笔记", "读书-笔记"},
+		{"带/斜杠", "带-斜杠"},
+		{"前端 & 后端", "前端-后端"},
+		{"a?b", "a-b"},
+		{"..", ""},
+		{"  ", ""},
+	} {
+		if got := tagSlug(c.in); got != c.want {
+			t.Errorf("tagSlug(%q) = %q，想要 %q", c.in, got, c.want)
+		}
+	}
+}
+
 // unlisted 的 id 就是它的全部秘密，不能进日志。
 func TestUnlistedIDStaysOutOfLogs(t *testing.T) {
 	id := "c64cf856cdb9a1cd65407159da7cf553"

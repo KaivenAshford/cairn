@@ -1,0 +1,109 @@
+# 仓库里的三套测试，每次 push 和 PR 都跑一遍。
+#
+# 这个仓库的原则是「安全性质要有跑得起来的断言，不能靠记得」（见 CLAUDE.md）。
+# 断言只在本地跑，等于回到了「靠记得」——记得跑。所以它们得有个不依赖人的地方跑。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 这些 job 只读代码：不发布、不回写、不评论 PR。默认的 write 权限给了它们
+# 一个用不上的能力，而 CI 是第三方 action 代码执行的地方，能力越少越好。
+permissions:
+  contents: read
+
+# 同一个分支上连着推几次时，只留最新那次。旧的跑完也没人看，白烧额度。
+# main 不设 cancel-in-progress 也行，但这里三套测试都是纯读的，取消不会留下半截状态。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 分成两个 job 而不是三个：Go 那半边和 Node 完全无关，拆出去并行，快的那个先给反馈；
+  # 而 test-visibility 自己会调 `npm run build` / `npx astro build`，必须有 node_modules。
+  # 把它单拎成第三个 job，就要再 checkout 一次、再 npm ci 一次，换来的并行度是零——
+  # 它本来就是 web 这条线上最慢的一步，拆开之后它还是最慢的，只是前面多挂了一次安装。
+  server:
+    name: server（Go）
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # 版本只写在 go.mod 一处。写死在这里的话，哪天改了 go.mod 这边不会有人记得跟。
+          go-version-file: server/go.mod
+          # 服务端是零依赖的，没有 go.sum。开着缓存只会让 action 找不到依赖文件报警，
+          # 而且本来也没有东西可缓存。
+          cache: false
+
+      - name: gofmt
+        # `gofmt -l` 列出没格式化的文件，但退出码是 0——不判断输出的话这一步永远通过。
+        run: |
+          files=$(gofmt -l .)
+          if [ -n "$files" ]; then
+            echo "以下文件没有格式化，跑一次 gofmt -w ：" >&2
+            echo "$files" >&2
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        # 带 -race：写入通道是并发的（HTTP handler + 临时文件 rename），
+        # 「并发不丢内容」这条断言不开竞态检测就只是碰运气。
+        run: go test -race ./...
+
+  web:
+    name: web（Astro）+ 可见度性质
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Astro 5 要 Node 18.20.8+ / 20.3+ / 22+，取当前 LTS。
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖
+        # 用 ci 不用 install：锁文件对不上时应当失败，而不是就地改掉锁文件。
+        # 「零新依赖」是这个站的一条硬约束，锁文件的完整性就是它的执行点。
+        working-directory: web
+        run: npm ci
+
+      - name: 灌示例条目
+        # 真实内容是单独的 private 仓库、被根 .gitignore 忽略，CI 上 checkout 出来
+        # 根本没有 web/content/entries/。空内容目录不会让构建挂掉，但会让测试失灵：
+        #   - test-visibility 里那条「chip 带 data-type（N 种）」要求首页至少出现 3 种 type
+        #     （六色配色成立的前提），空目录下只剩测试自己造的 list 和 link 两种，实测会红。
+        #   - 年份标记那条断言硬编码了「2026 年应当出现 1 个年份标记」，它依赖 fixtures 里
+        #     至少有一条 2026 的公开条目。空目录下同样会红。
+        # 所以先把 fixtures 灌进去，让 CI 跑在一个有内容的站上。
+        # 注意：断言里的「几种 chip」「几个页面」是随 fixtures 变的，改 fixtures 要一起看。
+        run: scripts/seed
+
+      - name: astro check
+        working-directory: web
+        run: npx astro check
+
+      - name: astro build
+        # 放在 test-visibility 前面：一个普通的构建错误应当报成「构建挂了」，
+        # 而不是让人从二十几条可见度断言的红叉里往回猜。
+        working-directory: web
+        run: npm run build
+
+      - name: 可见度安全性质
+        # 这一套才是这个仓库里最要紧的：private / circle 不进 dist、忘写 visibility 时
+        # 默认 private、unlisted 不上首页也不进任何别的产物。它会往内容目录里放临时条目、
+        # 跑真正的 astro build、再清干净。
+        run: scripts/test-visibility

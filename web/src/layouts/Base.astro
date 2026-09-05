@@ -6,10 +6,59 @@ interface Props {
   description?: string;
   /** unlisted 页面必须 noindex：它靠「搜不到」而不是靠认证。见 ARCHITECTURE.md 第 2 节。 */
   noindex?: boolean;
+  /** 一条条目是 article，其余（首页、/now、标签页、404）是 website。 */
+  ogType?: 'website' | 'article';
 }
 
-const { title, description, noindex = false } = Astro.props;
-const fullTitle = title ? `${title} · cairn` : 'cairn · 起居注';
+const { title, description, noindex = false, ogType = 'website' } = Astro.props;
+
+const SITE_NAME = 'cairn · 起居注';
+const SITE_DESC = '一个人的可浏览版本。';
+const fullTitle = title ? `${title} · cairn` : SITE_NAME;
+
+// 描述给一个站级兜底，而不是「没传就不写」。分享一个没有 description 的页面，
+// 微信/Telegram 那张卡片下面就是一片空白——空白不会有人报 bug，它只是看起来没做完。
+const desc = description ?? SITE_DESC;
+
+const canonical = new URL(Astro.url.pathname, Astro.site).href;
+
+/* ── 站徽：四块叠起来的石头 ─────────────────────────────────────────────────
+   cairn 是荒野里的石堆路标，一次放一块石头（见 README）。图形只有四个圆角矩形，
+   宽度自下而上收，左右各偏半格——正正对齐的四条杠像信号强度，偏一点才像人手码的石头。
+
+   **几何只写一遍**，下面两处用同一个 STONES：
+     · 标签页图标（data URI，颜色写死）
+     · 页眉字标前的那块小图（inline <svg>，fill=currentColor，跟着亮暗两套走）
+   两处各自画一遍的话，改了一处另一处不会有任何报错，站徽就悄悄变成两个标志。
+
+   为什么图标是内联 data URI 而不是 public/favicon.svg：零文件、零请求，
+   而且它跟着 HTML 一起发，不会出现「首页到了、图标还在转」那一下。
+   顺带把 /favicon.ico 那条每次访问都打的 404 消掉。 */
+const GLYPH_BOX = '0 0 32 32';
+// [x, y, 宽, 高]；圆角一律取高的一半，四块都是药丸形——石头没有直角。
+// 缝隙全部是 2.4（32 分之），不是随手排的：标签页图标实际只有 16px，
+// 2.4/32 落到屏幕上是 1.2px。再窄一点（比如石头做厚、缝隙留 1.5）在 16px 上是 0.75px，
+// 抗锯齿一糊四块就连成一个实心三角，图标就不是石堆而是一坨。
+const STONES: [number, number, number, number][] = [
+  [12.6, 3.2, 7.5, 4.6],
+  [9.4, 10.2, 12.5, 4.6],
+  [7.5, 17.2, 17.5, 4.6],
+  [4.5, 24.2, 23, 4.6],
+];
+const GLYPH = STONES.map(
+  ([x, y, w, h]) => `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${h / 2}"/>`,
+).join('');
+
+// 颜色写死成青的鲜色版（--accent-soft）：标签栏的底色由浏览器和系统主题决定，
+// 图标得同时落在亮暗两种上。深青 --accent(#176b6b) 在暗色标签栏上糊成一团，
+// 这一支对白底 3.6:1、对近黑底 4.3:1，两头都还认得出形状。
+// encodeURIComponent 顺便把 < > # " 全编码掉——data URI 里一个裸 # 就是片段标识符，
+// 图标会静静地不显示。
+const FAVICON =
+  'data:image/svg+xml,' +
+  encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${GLYPH_BOX}" fill="#1f8a8a">${GLYPH}</svg>`,
+  );
 ---
 
 <!doctype html>
@@ -18,14 +67,48 @@ const fullTitle = title ? `${title} · cairn` : 'cairn · 起居注';
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{fullTitle}</title>
-    {description && <meta name="description" content={description} />}
+    <meta name="description" content={desc} />
     {noindex && <meta name="robots" content="noindex, nofollow" />}
-    <link rel="canonical" href={new URL(Astro.url.pathname, Astro.site)} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" type="image/svg+xml" href={FAVICON} />
+
+    {/* 订阅源。手写的 Atom（见 pages/feed.xml.ts），数据源是 publicEntries()。
+        这一行是它唯一的发现入口：阅读器和浏览器扩展只认 head 里的 rel=alternate，
+        没有它，feed.xml 就只有知道路径的人才找得到。 */}
+    <link rel="alternate" type="application/atom+xml" title={SITE_NAME} href="/feed.xml" />
+
+    {/* Open Graph。缺了它，一条链接发到微信/Telegram/Slack 就是一行裸 URL，
+        而这个站的条目大多是短记——一行裸 URL 谁都不会点。
+
+        **unlisted 页面照样有这些标签**，看着像是在往外递东西，其实一个字都没多给：
+        og:url 就是这一页自己的地址，而对方手里已经有它了（不然打不开这一页）。
+        真正把秘密递出去的是 feed / sitemap / 标签页那种「猜得到的页面列出别人的 URL」，
+        og 不属于那一类。见 ARCHITECTURE.md 第 2 节。
+
+        **不做 og:image**：要么每条配一张图（大多数短记没有），要么构建时动态生成
+        （新依赖 + 新产物）。没有图的 summary 卡片仍然是标题 + 描述 + 域名，
+        比一行裸 URL 强得多；等真有值得配图的长文再说。
+        twitter:card 因此只能是 summary，不是 summary_large_image——
+        后者在没有 og:image 时会退化成一张空白卡。 */}
+    <meta property="og:type" content={ogType} />
+    <meta property="og:title" content={fullTitle} />
+    <meta property="og:description" content={desc} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:site_name" content={SITE_NAME} />
+    <meta property="og:locale" content="zh_CN" />
+    <meta name="twitter:card" content="summary" />
   </head>
   <body>
     <div class="wrap">
       <header class="site">
-        <a class="mark" href="/">cairn<span class="cn">起居注</span></a>
+        {/* 石堆图形和标签页图标是同一个 STONES。这里用 inline <svg> 而不是
+            background-image：fill=currentColor 才能跟着 .mark 的青色走，
+            暗色下那支青整支换过（--accent 亮暗两值不同），写死颜色的图会掉队。
+            aria-hidden：紧挨着的「cairn 起居注」已经把这个链接念清楚了。 */}
+        <a class="mark" href="/">
+          <svg class="glyph" viewBox={GLYPH_BOX} fill="currentColor" aria-hidden="true" set:html={GLYPH}></svg>
+          cairn<span class="cn">起居注</span>
+        </a>
         <nav>
           <a href="/">时间流</a>
           <a href="/now">现在</a>

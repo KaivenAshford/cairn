@@ -1,17 +1,22 @@
 ---
 import Base from '../layouts/Base.astro';
-import {
-  publicEntries, displayTitle, excerpt, formatDate, listItems, linkHost, TYPE_LABEL,
-} from '../lib/entries';
+import EntryCard from '../components/EntryCard.astro';
+import { publicEntries, TYPE_LABEL } from '../lib/entries';
 
 const entries = await publicEntries();
 const types = [...new Set(entries.map((e) => e.data.type))];
 
-// done 不显示：「写完了」是默认期待，标出来只是噪音。会说话的只有「还没写完」。
-const STATUS_LABEL: Record<string, string> = { seed: '种子', growing: '生长中' };
 
-// 清单卡最多铺几项。再多就从「预览」变成「把内容搬到首页」，条目页就没意义了。
-const PREVIEW = 4;
+
+/**
+ * 年份取 UTC，不取本地时区。
+ *
+ * frontmatter 里的 created 是纯日期（2026-09-04），z.coerce.date() 按 UTC 午夜解析。
+ * 用 getFullYear() 的话，在 UTC 以西的机器上 `2026-01-01` 会被读成 2025——
+ * 于是构建机器换个时区，首页就凭空多出一个年份标记，而卡片上的日期还写着 2026。
+ * entries.ts 的 formatDate 因为同一个理由用 getUTC*，两处必须一致。
+ */
+const yearOf = (d: Date) => d.getUTCFullYear();
 ---
 
 <Base description="一个人的可浏览版本。">
@@ -23,50 +28,28 @@ const PREVIEW = 4;
   )}
 
   <ul class="stream" id="stream">
-    {entries.map((e) => {
-      const type = e.data.type;
-      const status = e.data.status;
-      // 六种 type 共用一张卡的话，一句话的短记和一篇长文在屏幕上一样重。
-      // 所以卡片的结构本身按 type 分叉：长文有摘要和「读全文」，短记只有正文，
-      // 清单铺前几项，外链亮出域名。
-      const items = type === 'list' ? listItems(e) : [];
-      const host = type === 'link' ? linkHost(e) : null;
-      // 碎片 = 短记，或者任何没写标题的条目。没标题时 displayTitle 拿的就是正文首行，
-      // 再配一段以同一句话开头的摘要，等于把同一行字印两遍——那是这版之前首页最难看的地方。
-      const fragment = type === 'log' || !e.data.title;
-      const hasExcerpt = !fragment && !(type === 'list' && items.length > 0);
+    {entries.map((e, i) => {
+      // 年份标记：时间流上唯一的时间锚点。滚到第三屏时「我现在在哪一年」是靠猜的。
+      // 它留在这里而不进 EntryCard，是因为它得知道**上一条**是哪一年——
+      // 那是列表的事，不是单张卡的事。标签页也因此天然没有年份标记（它本来就短）。
+      const year = yearOf(e.data.created);
+      const newYear = i === 0 || yearOf(entries[i - 1].data.created) !== year;
       return (
-        <li class="card" data-type={type} data-fragment={fragment ? '' : undefined}>
-          <div class="card-head">
-            <span class="chip" data-type={type}>{TYPE_LABEL[type] ?? type}</span>
-            <time class="date" datetime={e.data.created.toISOString()}>{formatDate(e.data.created)}</time>
-            {status && STATUS_LABEL[status] && (
-              <span class="status" data-status={status}>{STATUS_LABEL[status]}</span>
-            )}
-          </div>
+        <Fragment>
+          {newYear && (
+            /* 它是 <li> 而不是 <div>：<ul> 的子元素只能是 <li>，塞个 div 进去
+               HTML 就不合法了，而 .stream 是 grid，两者的视觉效果完全一样。
 
-          {/* 碎片没有标题栏，正文本身就是标题——它本来就只有一句话，
-              再给它挤一个「（无题）」式的标题只会让它看起来像一篇没写完的文章。 */}
-          {/* 碎片走 excerpt，但它可能返回空串：正文只有代码块或表格时，
-              该剥的都剥完就什么都不剩了。displayTitle 内部有「（无题）」兜底，
-              所以退回它 —— 一张没有任何文字、却整片可点的卡是最糟的结果。 */}
-          <a class="t" href={`/e/${e.id}/`}>
-            {(fragment && excerpt(e, 120)) || displayTitle(e)}
-          </a>
+               但这样一来它就落进了筛选脚本的手里——见下面 <script> 里那段注释：
+               筛选只认 li.card，年份标记走另一条路（跟着它下面还剩几张卡走）。
 
-          {items.length > 0 && (
-            <ul class="preview">
-              {items.slice(0, PREVIEW).map((it) => <li>{it}</li>)}
-              {items.length > PREVIEW && <li class="rest">还有 {items.length - PREVIEW} 条</li>}
-            </ul>
+               aria-hidden：每张卡自己带一个完整日期的 <time>，年份是给眼睛扫读用的锚点，
+               不是新信息。留在无障碍树里的话，读屏器会在列表中间念出一串裸年份，
+               还会让「列表共 N 项」和筛选播报的条数对不上。 */
+            <li class="yearmark" aria-hidden="true"><span>{year}</span></li>
           )}
-
-          {hasExcerpt && excerpt(e, type === 'post' ? 120 : 90) &&
-            <p class="excerpt">{excerpt(e, type === 'post' ? 120 : 90)}</p>}
-
-          {host && <span class="host">{host}</span>}
-          {type === 'post' && <span class="more">读全文 →</span>}
-        </li>
+          <EntryCard entry={e} />
+        </Fragment>
       );
     })}
   </ul>
@@ -100,17 +83,41 @@ const PREVIEW = 4;
 
     // 卡片之间靠间距分开，不再靠分隔线，所以筛掉第一条也不会留下一条悬空的线——
     // 原先那套 data-lead 的补偿逻辑跟着分隔线一起去掉了。
-    // :scope > li 是必须的：清单卡里铺的前几项也是 <li>，但它们没有 data-type，
-    // 不加这层限定的话，一按「清单」筛选，被筛出来的清单卡自己的预览项会因为
-    // 「dataset.type 不等于 list」被整排隐藏——卡片只剩一个孤零零的标题。
-    stream.querySelectorAll<HTMLElement>(':scope > li').forEach((li) => {
-      li.hidden = want !== 'all' && li.dataset.type !== want;
-    });
+    //
+    // 只走 stream 的**直接子元素**，而且只把 .card 当卡片。两层限定各挡一件事：
+    //   · 只看直接子元素——清单卡里铺的前几项也是 <li>。抓所有 li 的话，
+    //     一按「清单」，被筛出来的清单卡自己的预览项会因为「dataset.type 不等于 list」
+    //     被整排隐藏，卡片只剩一个孤零零的标题。
+    //   · 只把 .card 当卡片——年份标记同样是顶层 <li>，但它没有 data-type。
+    //     不区分的话它会被当成一张「类型不匹配」的卡，于是一按任何类型，
+    //     整条流的年份锚点全部消失，而「全部」时它又被算进播报的条数里。
+    const kids = [...stream.children] as HTMLElement[];
+    for (const el of kids) {
+      if (el.classList.contains('card')) {
+        el.hidden = want !== 'all' && el.dataset.type !== want;
+      }
+    }
+
+    // 年份标记不参与筛选，它跟着「自己下面还剩不剩卡片」走：
+    // 一个底下一张卡都没有的「2024」是一句假话，比没有年份更糟。
+    // 从头扫一遍，每遇到下一个标记就给上一个结账。
+    let marker: HTMLElement | null = null;
+    let kept = false;
+    for (const el of kids) {
+      if (el.classList.contains('yearmark')) {
+        if (marker) marker.hidden = !kept;
+        marker = el;
+        kept = false;
+      } else if (!el.hidden) {
+        kept = true;
+      }
+    }
+    if (marker) marker.hidden = !kept;
 
     if (status) {
-      // 同样要限定层级：清单卡的预览项从不被设 hidden，不限定的话它们恒被计入，
-      // 而这个数字是屏幕阅读器用户按下筛选钮后唯一的反馈。
-      const n = stream.querySelectorAll(':scope > li:not([hidden])').length;
+      // 数的是卡片本身：清单卡的预览项从不被设 hidden，年份标记又不是内容。
+      // 这个数字是屏幕阅读器用户按下筛选钮后唯一的反馈，多数一条都是错的。
+      const n = stream.querySelectorAll(':scope > li.card:not([hidden])').length;
       status.textContent = `${btn.textContent}:${n} 条`;
     }
   });

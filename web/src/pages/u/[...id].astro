@@ -1,7 +1,10 @@
 ---
 import { render } from 'astro:content';
 import Base from '../../layouts/Base.astro';
-import { unlistedEntries, displayTitle, excerpt, formatDate, TYPE_LABEL, type Entry } from '../../lib/entries';
+import {
+  unlistedEntries, publicTagIndex, displayTitle, excerpt, formatDate, tagSlug, tagHref,
+  TYPE_LABEL, type Entry,
+} from '../../lib/entries';
 
 /**
  * unlisted：靠「搜不到、猜不到」而不是靠认证。
@@ -10,10 +13,30 @@ import { unlistedEntries, displayTitle, excerpt, formatDate, TYPE_LABEL, type En
  */
 export async function getStaticPaths() {
   const entries = await unlistedEntries();
-  return entries.map((entry) => ({ params: { id: entry.id }, props: { entry } }));
+
+  // 已经生成了页的标签。标签在这一页上只在「那个页真的存在」时才链出去。
+  const known = new Set((await publicTagIndex()).map((g) => g.slug));
+
+  return entries.map((entry) => ({
+    params: { id: entry.id },
+    props: {
+      entry,
+      // 一个只被 unlisted 条目用过的标签是没有标签页的（publicTagIndex 只看公开条目），
+      // 链过去就是 404，所以那种标签退化成纯文字。
+      // 反过来，链**出去**不泄露任何东西：标签页上永远只有公开条目，
+      // 从这一页走到 /t/ 是单向的，那边没有一条线索指回来。
+      tags: entry.data.tags.map((t) => ({
+        name: t,
+        href: known.has(tagSlug(t)) ? tagHref(t) : null,
+      })),
+    },
+  }));
 }
 
-const { entry } = Astro.props as { entry: Entry };
+const { entry, tags } = Astro.props as {
+  entry: Entry;
+  tags: { name: string; href: string | null }[];
+};
 const { Content } = await render(entry);
 ---
 
@@ -25,7 +48,20 @@ const { Content } = await render(entry);
       <span class="chip" data-type={entry.data.type}>{TYPE_LABEL[entry.data.type] ?? entry.data.type}</span>
       {' '}<time datetime={entry.data.created.toISOString()}>{formatDate(entry.data.created)}</time>
       {' '}· 未列出，仅通过链接访问
+      {tags.length > 0 && (
+        <span class="tags">
+          {tags.map((t) => (t.href
+            ? <a class="tag" href={t.href}>#{t.name}</a>
+            : <span class="tag">#{t.name}</span>))}
+        </span>
+      )}
     </div>
     <Content />
   </article>
+
+  {/* 这一页**故意没有上下篇**，而 /e/ 有。
+      这是「unlisted 的全部防护就是猜不到」的直接推论：上下篇会把相邻那条 unlisted 的
+      URL 印在页面上，于是拿到其中一条链接的人，顺着点就能走完全部未列出条目——
+      我发出去一条链接，对方拿到的是整批。一条链接只换一条内容，这是 unlisted 唯一的边界。
+      别顺手补上。见 ARCHITECTURE.md 第 2 节，以及 scripts/test-visibility 里的断言。 */}
 </Base>

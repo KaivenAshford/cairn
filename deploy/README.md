@@ -42,7 +42,9 @@ scripts/publish
 docker compose -f deploy/docker-compose.yml up -d
 
 # 6. Caddy
-cp deploy/Caddyfile /etc/caddy/Caddyfile && systemctl reload caddy
+cp deploy/Caddyfile /etc/caddy/Caddyfile
+caddy validate --config /etc/caddy/Caddyfile   # 先验一遍，错在哪它会直说
+systemctl reload caddy
 ```
 
 ## 容易踩的几脚
@@ -58,6 +60,21 @@ healthcheck 一直红。`docker compose logs server` 第一行就会告诉你。
 **别在 compose 里删掉 `CAIRN_ADDR: 0.0.0.0:8787`。** `.env` 里那个 `127.0.0.1:8787`
 是给宿主机直跑准备的；容器里绑回环的话，经端口映射进来的连接会被全部拒绝，
 而症状极具迷惑性——容器 running、healthcheck 绿的（探活也在容器内），只有外部访问失败。
+
+**改 Caddyfile 时别把 `handle_errors` 那段删了 —— 删掉 = 站上没有 404 页。**
+`file_server` 找不到文件时返回的是 Caddy 自带的空白 404，它**不会**自己去用同目录下的
+`404.html`；`web/src/pages/404.astro` 构建出来的那一页要靠 `handle_errors` 才发得出去。
+里面两处看着可以省、其实不能省：
+
+- **按状态码分流。** 只有 404 才发那一页。Go 服务没起来时 `reverse_proxy` 报的是 502，
+  给 502 回一张「没有这一页」等于把「服务挂了」说成「你地址输错了」，
+  而这两件事该做的处置完全相反。
+- **`file_server { status 404 }`。** 发一个存在的文件默认是 200，于是「找不到」会以 200
+  发出去（soft 404）。搜索引擎会把这张页当正文收录；更要紧的是 `unlisted` 那套
+  「猜不到」的防护，前提正是猜错时得到一个明确的否定。
+
+`/api/*` 和 `/circle/*` 不受影响：`reverse_proxy` 原样透传上游的状态码，
+Go 服务自己返回的 401 / 501 是正常响应，不是错误，不进错误路由。
 
 **用 `scripts/publish`，不要直接 `npm run build`。** astro build 会先清空 outDir 再生成，
 而 outDir 就是 Caddy 的 docroot。一次失败的构建会把线上所有页面删光，并在 docroot 里

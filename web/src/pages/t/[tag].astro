@@ -1,0 +1,43 @@
+---
+import Base from '../../layouts/Base.astro';
+import EntryCard from '../../components/EntryCard.astro';
+import { publicTagIndex, type Entry } from '../../lib/entries';
+
+/**
+ * 标签页：一个标签下的全部公开条目。
+ *
+ * 标签在这之前是纯死数据——schema 定义了它、写入通道认真序列化它、三条条目都写了标签，
+ * 而整个展示层一处都没读。写标签没有任何回报的话，早晚就不写了；
+ * 这一页是给「写标签」这件事的回报。
+ */
+export async function getStaticPaths() {
+  // 数据源是 publicTagIndex()，它只看 publicEntries()——绝不能是 loadEntries()。
+  // 理由写在 lib/entries.ts 的 publicTagIndex 上面：标签页是猜得到的，
+  // 而 unlisted 的全部防护是猜不到，一条 unlisted 混进来就等于把它的 URL 念出来。
+  const groups = await publicTagIndex();
+  return groups.map((g) => ({
+    params: { tag: g.slug },
+    props: { name: g.name, entries: g.entries },
+  }));
+}
+
+const { name, entries } = Astro.props as { name: string; entries: Entry[] };
+
+// 卡片用的是和首页同一个 EntryCard 组件。这一页最早是把首页那段 markup 复制过来的，
+// 结果首页加影像分支时这边没跟上——同一条影像条目在首页有图、在这里只剩一行图注。
+// 「同一条内容在两个页面上长得不一样」正是完成度不高最典型的症状，所以它只能有一份。
+//
+// 这一页没有年份标记：那个要知道上一条是哪一年，是列表的事；而标签页本来就短，
+// 不需要时间锚点。也没有筛选条——按标签进来的人已经筛过一次了。
+---
+
+<Base title={`#${name}`} description={`标记为「${name}」的条目，共 ${entries.length} 条。`}>
+  <header class="tag-head">
+    <h1>#{name}</h1>
+    <p class="count">{entries.length} 条 · <a href="/">回到时间流</a></p>
+  </header>
+
+  <ul class="stream">
+    {entries.map((e) => <EntryCard entry={e} />)}
+  </ul>
+</Base>

@@ -186,6 +186,15 @@ func (c config) handleWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	for _, t := range req.Tags {
+		if tagSlug(t) == "" {
+			badRequest(w, fmt.Sprintf(
+				"标签 %q 里没有任何字母、数字或中文，做不出 URL 里的一段。\n"+
+					"标签会变成 /t/<标签>/ 这个页面的地址。", t))
+			return
+		}
+	}
+
 	// 自动生成 id 那条路径上，unlisted 一定拿到 randomHex(16)。但显式给了 id 就绕过了
 	// entryID，于是 `n -i salary-numbers -v unlisted` 会落一个猜得到的文件名。
 	// 构建那一关（web/src/lib/entries.ts 的 RANDOM_ID）确实会拦住，但那时已经晚了：
@@ -257,6 +266,21 @@ func (c config) handleWrite(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// tagUnsafe 与 web/src/lib/entries.ts 的 tagSlug 保持同一套规则：
+// 标签会变成 /t/<slug>/ 这个路由的参数，也就是 dist 下的目录名，
+// 所以除字母、数字、中文之外的字符一律折成 `-`。
+var tagUnsafe = regexp.MustCompile(`[^\p{L}\p{N}]+`)
+
+// tagSlug 是 web/src/lib/entries.ts 里那个函数的 Go 版本。**两边必须一致**——
+// 和「两处默认值都是 private」同一个道理：构建那一端已经会为坏标签大声失败，
+// 但那时候东西已经落盘了。写入这一端不拦的话，手机上发一条标签手滑的记录会返回 201，
+// 而下一次 scripts/publish 构建失败、拒绝换产物，整站冻结在上一版，
+// 直到有人 ssh 上去手改那个 md。非法 type 是当场 400 的，标签没有理由例外。
+func tagSlug(tag string) string {
+	s := tagUnsafe.ReplaceAllString(strings.ToLower(strings.TrimSpace(tag)), "-")
+	return strings.Trim(s, "-")
 }
 
 // logID 决定一个 id 能不能进日志。

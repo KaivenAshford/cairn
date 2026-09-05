@@ -266,6 +266,18 @@ header.site .mark .cn {
   color: var(--muted); font-weight: 500; margin-left: .55rem; font-size: var(--fs-sm);
   letter-spacing: .06em;
 }
+/* 字标前的那堆石头。几何写在 Base.astro 里（STONES），标签页图标用的是同一份——
+   两处各画一遍的话，改了一处另一处不会报任何错，站徽就悄悄变成两个标志。
+   这里是 inline <svg> + fill:currentColor 而不是 background-image：
+   青这一支亮暗两套是两个不同的值（--accent 在暗色下整支换过），
+   颜色写死在图里的话，暗色下石头会掉队。
+   尺寸用 em：跟着 .mark 的字号走，改字号不用回来同步改这里。 */
+header.site .mark .glyph {
+  width: 1.05em; height: 1.05em; margin-right: .42em;
+  /* svg 是替换元素，默认拿自己的下边缘当基线。图形底下留了约一成空白，
+     往下压 .12em 才让最下面那块石头正好落在文字的基线上。 */
+  vertical-align: -.12em;
+}
 header.site nav { margin-left: auto; display: flex; gap: .35rem; font-size: var(--fs-sm); }
 header.site nav a {
   color: var(--muted); text-decoration: none; padding: .25rem .7rem; border-radius: 999px;
@@ -308,6 +320,39 @@ header.site nav a:hover { color: var(--accent); background: var(--chip-bg); }
      而 body 的 overflow-wrap 只管换行、不改 min-content。于是正文里一条不可断的
      长 URL 就能把整条轨道撑破视口——实测 200% 字号下 375px 视口横向滚动。 */
   grid-template-columns: minmax(0, 1fr); gap: .85rem; }
+
+/* ── 年份标记 ─────────────────────────────────────────────────────────────── */
+
+/* 时间流上唯一的时间锚点：滚到第三屏时「我现在在哪一年」原先只能靠逐张卡去读日期。
+
+   粘性，但**只有那颗药丸是实心的**，整条不铺底色。
+   铺整条就得给它一个不透明的背景，而页顶那层青色氛围是画在 body 上、跟着文档滚的
+   （见 body 的 linear-gradient）——一条纯 --bg 的横杠压在渐变上，接缝在第一屏就看得见，
+   而且没法修：那道渐变的浓淡取决于滚动位置，CSS 里配不出来。
+   药丸只有几十像素宽，卡片从它两边滚过去，看起来就是聊天软件里那颗浮着的日期标签。 */
+/* sticky 的实话：.stream 是 grid，年份标记是它的 grid item，而 grid item 的包含块
+   就是它自己那一行——可移动的距离只有 margin 那点余量。所以它不会像聊天软件的日期标签
+   那样「浮在那儿、卡片从两边滚过去」，它是一颗跟着内容滚走的普通药丸。
+   留着 sticky 是因为它无害，而且将来 .stream 若改回普通流就会自动生效；
+   真想要那个效果，得先把 .stream 从 grid 换掉，那会牵动卡片的 min-width 下限。 */
+.yearmark {
+  position: sticky; top: .5rem; z-index: 3;
+  display: flex; margin: .95rem 0 0;
+  /* 透明的那一条横跨整个版心，不能把它底下卡片的 hover 和点击吃掉 */
+  pointer-events: none;
+}
+.stream > .yearmark:first-child { margin-top: 0; }
+/* 和 .filters 同一个坑：作者样式里的 display:flex 无论特异性高低都会赢 UA 的
+   [hidden]{display:none}。不补这一条，筛选时「底下一张卡都不剩」的年份标记照样浮着。 */
+.yearmark[hidden] { display: none; }
+/* --muted 压在 --chip-bg 上：亮色 5.08:1、暗色 5.11:1，12px 小字要的是 4.5:1。 */
+.yearmark span {
+  padding: .2rem .75rem; border-radius: 999px;
+  background: var(--chip-bg); color: var(--muted);
+  font-size: var(--fs-xs); font-weight: 700; letter-spacing: .14em; line-height: 1.7;
+  font-variant-numeric: tabular-nums;
+  box-shadow: var(--shadow-1);
+}
 
 .card {
   position: relative;
@@ -422,6 +467,28 @@ header.site nav a:hover { color: var(--accent); background: var(--chip-bg); }
   letter-spacing: -.01em; word-break: break-all;
 }
 
+/* photo：六型里唯一「内容就是那张图」的一支，而这张卡上原先从不出现图像——
+   正文位置显示的是 excerpt 剥出来的 alt，一张影像卡上印着「一张图的说明」，图不在。
+
+   图排在标题上面：影像条目多半没写标题，那行字本来就是图注，
+   把图排在图注下面等于说「这条的重点是这行字」。
+
+   aspect-ratio 是硬给的，不是懒。卡片上的 src 是从正文原文里正则抠出来的裸路径
+   （见 entries.ts 的 firstImage），没有任何宽高信息；不预留位置的话，
+   图一到就把它下面所有的卡往下顶——一次滚动里连跳好几次。
+   3:2 是取舍：横图正好，竖图会被 cover 裁掉上下两截。宁可裁一张预览，
+   也不要一张按原比例撑满半屏、把时间流挤成图册的卡；完整的图在条目页上。 */
+.shot {
+  margin: .15rem 0 .75rem;
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  /* 图还没到（或者 404）时留下的不是一个白洞，而是这一支颜色的一块淡底 */
+  background: color-mix(in srgb, var(--t-ink) 10%, var(--t-wash));
+}
+/* 图不单独做成链接：.card .t::after 已经铺满整张卡，图本来就在那块点击区底下。
+   再套一个 <a> 只会让同一张卡出现两个指向同一处的链接，读屏器要念两遍。 */
+.shot img { display: block; width: 100%; aspect-ratio: 3 / 2; object-fit: cover; }
+
 /* list：把前几项直接铺出来。清单的信息在项里，标题只是个文件名 */
 .card .preview { list-style: none; margin: .65rem 0 0; padding: 0; font-size: var(--fs-ms); color: var(--muted); }
 .card .preview li { position: relative; padding-left: 1.05rem; margin-top: .3rem; line-height: 1.7; }
@@ -455,7 +522,11 @@ header.site nav a:hover { color: var(--accent); background: var(--chip-bg); }
   background: transparent;
   box-shadow: inset 0 0 0 1.5px currentColor;
 }
-.seed { color: var(--t-ink); }   /* 旧标记，留着兼容还没改的页面 */
+/* 条目页用的是 .seed，时间流用的是 .status[data-status] —— 两套标记同时活着。
+   合并成一套的话得同时改 e/[...id].astro 和 u/[...id].astro 的 markup，
+   而它们的元信息行还有别的差异（更新于、未列出）。先记下这笔债，别把注释写成
+   「旧标记，留着兼容」——那会让下一个人以为没人用了，顺手删掉。 */
+.seed { color: var(--t-ink); }
 
 .empty { color: var(--muted); }
 
@@ -589,6 +660,108 @@ article.entry figcaption { font-size: var(--fs-sm); color: var(--muted); text-al
   }
 }
 
+/* ── 标签 ─────────────────────────────────────────────────────────────────── */
+
+/* 标签长得像筛选钮（淡底 + 深字 + 一圈淡描边），因为它们是同一件事：
+   都是「把流收窄到这一类」。同一个动作在站上有两种长相，读者要学两遍。
+   底用 w2 而不是 w：条目页整页的底本来就是 w，同色的话标签就化在纸里了。 */
+/* 不写 white-space: nowrap（chip 写了，因为类型名恒是两个字）：标签是手打的，
+   一个十几字的标签在 375px 上会顶出横向滚动，那是 WCAG 1.4.10。
+   宁可让它在药丸里折行，也不要整页能左右拉。 */
+.meta .tags { display: inline-flex; flex-wrap: wrap; gap: .35rem; }
+.meta .tag {
+  font-size: var(--fs-sm); line-height: 1.7; text-decoration: none;
+  padding: .05rem .55rem; border-radius: 999px;
+  background: var(--t-wash-2); color: var(--t-ink);
+  border: 1px solid color-mix(in srgb, var(--t-ink) 25%, transparent);
+  transition: border-color .15s var(--ease), background-color .15s var(--ease);
+}
+/* hover 只把描边加重，不改字色。全站的 a:hover 会把字染成青，而标签在这里是
+   「这一条属于哪几堆」的一部分，跟着条目那一支颜色走；染成青会让它看起来
+   忽然变成一个界面控件。特异性 (0,2,1) 压得住 a:hover 的 (0,1,1)。 */
+a.tag:hover {
+  color: var(--t-ink);
+  border-color: color-mix(in srgb, var(--t-ink) 55%, transparent);
+  background: color-mix(in srgb, var(--t-ink) 8%, var(--t-wash-2));
+}
+
+/* 标签页的抬头。用 h2 的字号而不是 h1 的：这一页的主角是下面那摞卡片，
+   抬头只是一句「它们凭什么摞在一起」。给它 34px 会让它比每一条内容都重。 */
+.tag-head { margin: 0 0 1.5rem; }
+.tag-head h1 {
+  font-size: var(--fs-xl); font-weight: 700; line-height: 1.3;
+  letter-spacing: -.01em; margin: 0 0 .3rem; text-wrap: balance;
+}
+.tag-head .count { margin: 0; color: var(--muted); font-size: var(--fs-sm); }
+
+/* ── 条目页的目录 ─────────────────────────────────────────────────────────── */
+
+/* 只有长文、且分了三节以上才有（见 e/[...id].astro）。
+   做成正文里的一块淡框，不做成浮在侧边的一栏：45rem 的版心两侧没有地方，
+   而 position:fixed 的浮层在窄屏上会盖住正文——那是「加了目录反而更难读」。
+   位置在分隔线之后、正文之前：先看清这篇分几节，再开始读。 */
+.toc {
+  margin: 0 0 2.4rem;
+  padding: .85rem 1.15rem 1rem;
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--t-ink) 6%, var(--t-wash));
+  border: 1px solid color-mix(in srgb, var(--t-ink) 20%, var(--t-wash));
+}
+.toc .toc-h {
+  margin: 0 0 .5rem;
+  font-size: var(--fs-xs); font-weight: 700; letter-spacing: .12em; color: var(--t-ink);
+}
+/* 用 ol 是因为顺序有意义（读屏器会念「共 N 项」），但不显示序号：
+   目录项的编号会和正文里手写的「## 一、」撞成「1. 一、」。 */
+.toc ol { list-style: none; margin: 0; padding: 0; font-size: var(--fs-ms); }
+.toc li { margin: 0; }
+.toc li + li { margin-top: .32rem; }
+/* h3 只靠缩进降一级，不加圆点也不加线：目录本来就该比正文安静。 */
+.toc li[data-depth="3"] { padding-left: 1.2em; font-size: var(--fs-sm); }
+.toc a { color: var(--fg); text-decoration: none; }
+.toc a:hover { color: var(--t-ink); text-decoration: underline; text-decoration-color: currentColor; }
+/* 从目录点过去时，标题不贴着视口上沿——上面留一口气才看得出「这一节从这里开始」。 */
+article.entry :is(h2, h3) { scroll-margin-top: 1.5rem; }
+
+/* ── 条目页的上下篇 ───────────────────────────────────────────────────────── */
+
+/* 两栏定死，不用 space-between：第一条和最后一条只有一个邻居，
+   space-between 会把那一个甩到左边——于是「更旧的 →」出现在本该是「← 更新的」的位置，
+   箭头指着一个方向，位置说的是另一个。grid 让每一侧永远待在自己那一栏里。
+   宽度跟 article.entry 对齐（同一个 max-width），不然它会比正文卡宽出一截。 */
+.pager {
+  max-width: calc(var(--measure) + 4.6rem);
+  margin: 1rem auto 0;
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: .85rem;
+}
+/* 上下篇不穿本条的颜色（不写 --t-*，落在 :root 的中性兜底上）：
+   它们是通往**别的**条目的门，穿这一条的色会让人以为下一条也是同一类。 */
+.pager a {
+  grid-column: 1;
+  display: flex; flex-direction: column; gap: .15rem;
+  text-decoration: none;
+  padding: .75rem 1rem; border-radius: var(--r-card);
+  background: var(--surface); border: 1px solid var(--line);
+  box-shadow: var(--shadow-0), var(--shadow-in);
+  transition: background-color .15s var(--ease), border-color .15s var(--ease),
+              box-shadow .15s var(--ease);
+}
+.pager .next { grid-column: 2; align-items: flex-end; text-align: right; }
+.pager a:hover {
+  background: var(--surface-2);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
+  box-shadow: var(--shadow-1), var(--shadow-in);
+}
+.pager .dir { font-size: var(--fs-xs); color: var(--muted); letter-spacing: .06em; }
+/* 标题最多两行。相邻那条要是一条 60 字的短记（碎片的标题就是正文首行），
+   不截的话半栏宽能排到六七行，上下篇比正文还长。 */
+.pager .title {
+  color: var(--fg); font-size: var(--fs-ms); font-weight: 600; line-height: 1.5;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  line-clamp: 2; overflow: hidden;
+}
+.pager a:hover .title { color: var(--accent); }
+
 /* ── 页脚 ─────────────────────────────────────────────────────────────────── */
 
 footer.site {
@@ -614,6 +787,10 @@ footer.site::before { top: 0; }
   header.site nav { margin-left: auto; gap: .15rem; }
   header.site nav a { padding: .25rem .5rem; }
   article.entry pre { padding: .85rem .9rem; font-size: .875rem; }
+  /* 375px 上两栏各只剩 ~150px，标题会碎成一列一列的字。改成上下两块；
+     方向仍然由「← 更新的 / 更旧的 →」这几个字给出，不靠左右位置。 */
+  .pager { grid-template-columns: minmax(0, 1fr); }
+  .pager .next { grid-column: 1; align-items: flex-start; text-align: left; }
   /* 窄屏上六个筛选钮会折成两行，间距收紧一点，免得它们比第一张卡还高 */
   .filters { gap: .35rem; }
   .filters button { padding: .18rem .7rem; }

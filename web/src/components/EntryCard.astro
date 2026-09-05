@@ -1,0 +1,93 @@
+---
+import {
+  displayTitle, excerpt, formatDate, firstImage, listItems, linkHost,
+  TYPE_LABEL, type Entry,
+} from '../lib/entries';
+
+interface Props {
+  entry: Entry;
+}
+const { entry: e } = Astro.props;
+
+/**
+ * 时间流上的一张卡。
+ *
+ * 抽成组件不是为了少写几行，是因为**它被复制过一次就立刻漂移了**：
+ * 标签页最早是首页卡片的拷贝，然后首页加了影像分支，标签页没跟上——
+ * 同一条影像条目在首页有图、在标签页只剩一行图注，正是那一版 CSS 注释里
+ * 写着「一张影像卡上印着一张图的说明，而图不在」的那个症状。
+ * 六种 type 各有分叉，这段逻辑只能有一份。
+ *
+ * 年份标记不在这里：它是时间流独有的（标签页本来就短，不需要时间锚点），
+ * 而且它得知道**上一条**是哪一年，那是列表的事，不是单张卡的事。
+ */
+
+// done 不显示：「写完了」是默认期待，标出来只是噪音。会说话的只有「还没写完」。
+const STATUS_LABEL: Record<string, string> = { seed: '种子', growing: '生长中' };
+
+// 清单卡最多铺几项。再多就从「预览」变成「把内容搬到首页」，条目页就没意义了。
+const PREVIEW = 4;
+
+const type = e.data.type;
+const status = e.data.status;
+
+// 六种 type 共用一张卡的话，一句话的短记和一篇长文在屏幕上一样重。
+// 所以卡片的结构本身按 type 分叉：长文有摘要和「读全文」，短记只有正文，
+// 清单铺前几项，外链亮出域名，影像铺图。
+const items = type === 'list' ? listItems(e) : [];
+const host = type === 'link' ? linkHost(e) : null;
+const shot = type === 'photo' ? firstImage(e) : null;
+
+// 碎片 = 短记，或者任何没写标题的条目。没标题时 displayTitle 拿的就是正文首行，
+// 再配一段以同一句话开头的摘要，等于把同一行字印两遍——那是这版之前首页最难看的地方。
+const fragment = type === 'log' || !e.data.title;
+
+// 影像卡有图时不再渲染摘要：photo 的正文往往只有那句 `![说明](图)`，
+// excerpt 剥完剩下的就是 alt。图上面印一遍说明、下面再印一遍同一句，是同一类重复。
+const hasExcerpt = !fragment && !shot && !(type === 'list' && items.length > 0);
+const summary = hasExcerpt ? excerpt(e, type === 'post' ? 120 : 90) : '';
+---
+
+<li class="card" data-type={type} data-fragment={fragment ? '' : undefined}>
+  <div class="card-head">
+    <span class="chip" data-type={type}>{TYPE_LABEL[type] ?? type}</span>
+    <time class="date" datetime={e.data.created.toISOString()}>{formatDate(e.data.created)}</time>
+    {status && STATUS_LABEL[status] && (
+      <span class="status" data-status={status}>{STATUS_LABEL[status]}</span>
+    )}
+  </div>
+
+  {/* 影像卡：图在最上面，标题当图注。影像条目的内容就是那张图，
+      把它排在标题下面等于说「这条的重点是这行字」。
+      alt="" 是有意的：紧跟着的 <a class="t"> 已经把这张卡念清楚了
+      （photo 多半没标题，那行字本来就是 alt），图再念一遍就是重复；
+      带真实 alt 的完整那张图在条目页上。
+      aspect-ratio + object-fit 由 CSS 给：抠出来的是裸 src，没有宽高，
+      不预留位置的话图一到就把下面所有卡往下顶。 */}
+  {shot && (
+    <div class="shot">
+      <img src={shot.src} alt="" loading="lazy" decoding="async" />
+    </div>
+  )}
+
+  {/* 碎片没有标题栏，正文本身就是标题——它本来就只有一句话，
+      再给它挤一个「（无题）」式的标题只会让它看起来像一篇没写完的文章。
+      碎片走 excerpt，但它可能返回空串：正文只有代码块或表格时，该剥的都剥完
+      就什么都不剩了。displayTitle 内部有「（无题）」兜底，所以退回它——
+      一张没有任何文字、却整片可点的卡是最糟的结果。 */}
+  <a class="t" href={`/e/${e.id}/`}>
+    {(fragment && excerpt(e, 120)) || displayTitle(e)}
+  </a>
+
+  {items.length > 0 && (
+    <ul class="preview">
+      {items.slice(0, PREVIEW).map((it) => <li>{it}</li>)}
+      {items.length > PREVIEW && <li class="rest">还有 {items.length - PREVIEW} 条</li>}
+    </ul>
+  )}
+
+  {summary && <p class="excerpt">{summary}</p>}
+
+  {host && <span class="host">{host}</span>}
+  {type === 'post' && <span class="more">读全文 →</span>}
+</li>

@@ -40,58 +40,50 @@
 - **卡片按 type 分叉是设计的前提,不是装饰。** chip 的 `data-type` 少了,六种颜色全部
   退回默认色,整版设计只剩白卡;清单卡不铺项、外链卡不显示域名的话,一张「在读」和
   一条随手记在屏幕上一样重。这几条都由 `scripts/test-visibility` 钉着。
+- **`tagSlug` 在两处必须产出一样的结果**(`server/write.go` 与 `web/src/lib/entries.ts`)。
+  标签会变成 `/t/<slug>/` 的目录名;两边不一致的后果是「服务端放行、下次构建失败」,
+  而构建失败会让 `scripts/publish` 拒绝换产物,整站冻结到有人手改那个 md。
+  和「两处默认值都是 private」同一个道理,`server/write_test.go` 有对照断言钉着。
 - **纯私密日记不上网。** 站上只放「至少愿意给一个人看」的东西。
 - 未实现的东西一律拒绝请求(现在 `/circle/*` 返回 501),绝不为了「先跑起来」而放行。
 
 ## 当前状态(2026-09-05)
 
-**基础(博客那一半)做扎实了,视觉也重做过一轮。** 其余部分一律停在原地等审核。
+**基础做扎实了,视觉重做过一轮,出口和 CI 也补齐了。** circle / pipeline / 算力接口
+一律停在原地等审核。
 
-**内容与代码已分仓**:真实条目在单独的 private 仓库(clone 到 `web/content/entries/`),
-代码仓里只有 `web/content/fixtures/` 那 3 条示例。服务端因此只有一个内容目录,
-可见度纯由 frontmatter 决定。详见 ARCHITECTURE.md 第 2 节。
+**内容与代码分仓**:真实条目在单独的 private 仓库(clone 到 `web/content/entries/`),
+代码仓里只有 `web/content/fixtures/` 那 3 条示例。详见 ARCHITECTURE.md 第 2 节。
 
-**视觉是「六色卡纸」**:卡片式时间流,六种 type 各一支色相(OKLCH 同明度带上取,
-锁死明度只转色相,六个色块份量才一样重),每张卡是自己那支淡色底 + 顶端渐变色条 +
-实心 chip。而且卡片**按 type 长得不一样**——长文最大、短记是一句话、外链带域名、
-清单直接铺前几项。这一版之前有过五个方案,选它的过程记在 `audit/`。
+**视觉是「六色卡纸」**:卡片式时间流,六种 type 各一支色相,卡片**按 type 长得不一样**
+(长文最大、短记是一句话、外链带域名、清单铺前几项、影像铺图)。
+卡片只有一份实现:`web/src/components/EntryCard.astro`,首页和标签页共用——
+它被复制过一次就立刻漂移了(首页加影像分支时标签页没跟上)。
 
-`server/`(Go,零依赖)`gofmt` / `go vet` / `go test -race` 全过,26 个测试。
-`web/`(Astro 5)`astro check` 0 errors,`scripts/test-visibility` 26 条性质全过。
-两套测试都做过变异验证(把修复改坏,确认测试真的会失败),不是摆设。
+**站现在有出口了**:`/feed.xml`(手写 Atom)、`/sitemap.xml`、`/robots.txt`、
+Open Graph、内联 SVG 的 favicon(和站徽同一堆石头)。三样产物的数据源都是
+`publicEntries()`——**绝不能是 `loadEntries()`**,那会把 unlisted 的随机 URL
+群发给订阅者、交给搜索引擎。
 
-**这一轮修掉的真问题**(每条都有对应测试兜住):
+**导航**:标签页 `/t/<slug>/`(标签终于不再是死数据)、条目页的上一篇/下一篇、
+首页的年份标记。`/u/` 的未列出页**故意不加上下篇**——那会把别的 unlisted 条目的
+URL 泄露给拿到其中一条的人。
 
-| 问题 | 后果 |
-|---|---|
-| `os.Stat` + `os.Rename` 的 TOCTOU | 12 路并发同标题 → 9 个 201 但磁盘只剩 1 个文件 |
-| `yamlString` 不转义 C0 字符 | 带 ANSI 码的标题 → 落盘成功 → 下次构建整站挂 |
-| `findEntry` 丢掉 `parseFrontmatter` 的 ok | 更新 CRLF/BOM 行尾的公开条目 → 200 但字段全被抹掉、掉回 private |
-| 显式 id 绕过 unlisted 随机名 | 回 201 + 一个永不存在的 URL,而整站从此构建不出来 |
-| upsert 读-改-写无串行化 | 并发时「收回成 private」被沿用旧值的编辑写回 public |
-| `formatDate` 用本地时区 | UTC 以西每一条都显示成前一天 |
-| `astro build` 直写 docroot | 构建失败先清空产物,还留下含全部正文的中间 chunk |
-| 容器 uid 与 mount 属主不符 | 按 `deploy/` 起容器,写入通道每条都 500 |
-| `.stream` 的 grid 轨道没有 0 下限 | 一条长 URL 撑破视口,200% 字号下横向滚动(WCAG 1.4.4) |
-| 碎片卡标题可能整个为空 | 纯表格/纯代码块的条目 → 一张没有任何文字、却整片可点的卡 |
-| `displayTitle` 只看正文首行 | 正文以表格开头 → 标题退回「（无题）」,而下一段明明有正文 |
-| `listItems` 放行缩进子项 | 子项被当顶层铺出来,还挤占名额让「还有 N 条」算错 |
-| `linkHost` 没排除图片语法 | 外链卡显示的是配图的图床域名,不是链接真正指向的地方 |
-| 筛选脚本抓所有 `li` | 按类型筛选会把清单卡自己的预览项一起隐藏 |
-| 用 `opacity` 表达弱化 | 它会乘到前景色上,两处因此掉到 AA 以下(3.57 / 3.96) |
-| `test-visibility` 无条件覆盖 fixture | **会静默删掉内容目录里的同名真实条目**,而那个目录不进代码仓的 git |
+**CI**:`.github/workflows/ci.yml`,两个并行 job。注意 CI 上 `web/content/entries/`
+不存在(它是另一个仓库),所以 web job 必须先跑 `scripts/seed`。
 
-**新增能力**:写入通道支持按 id 更新(`n -i now "..."`),保留 `created`、写 `updated`、
-继承没提供的字段。
+`server/` 24 个测试(`go test -race` 全过),`scripts/test-visibility` **81 条**性质。
+两套都做过变异验证——把修复改坏,确认测试真的会失败。
 
-**未实现,且需要先过审再做**:`/circle/*` 的会话与渲染、magic link、`pipeline/` 的数据采集、
-算力接口、手机端写入入口、写入后自动重建、CI。
+**未实现,需要先过审再做**:`/circle/*` 的会话与渲染、magic link、`pipeline/` 的数据采集、
+算力接口、手机端写入入口、写入后自动重建。
 
-**还欠两处**(都在 `audit/` 的验证报告里):
-1. `photo` 是六型里唯一拿到了颜色却没有结构分支的——影像卡上从不出现图像。
-   要么做图片支持,要么把注释改成「四种有分支」。
-2. 暗色代码块的注释色只有 3.05:1(github-dark 自带),改 CSS 修不掉,
-   要换成 `*-high-contrast` 主题,代价是配色变艳一点。
+**已知的债**:
+- `.yearmark` 的 `position: sticky` 在 grid item 上活动范围只有自己那一行,
+  不是注释原本描述的那种「浮在那儿」。要那个效果得先把 `.stream` 从 grid 换掉。
+- 条目页用 `.seed`、时间流用 `.status[data-status]`,两套状态标记同时活着。
+- `/now/` 与 `/e/now/` 是同一份内容的两个 URL,canonical 各指各的。
+  sitemap 只推荐 `/now/`,真要收口得改 `Base.astro`。
 
 ## 下一步(按这个顺序)
 
@@ -113,6 +105,7 @@ cd server && CAIRN_TOKEN=$(openssl rand -hex 32) go run .
 n "刚想到的一件事"                                  # scripts/n,默认 log + private
 n -v public -t post -T "标题" "正文"
 n -i now "在建这个站"                               # 按 id 更新已有条目
+n -g tsgo,编译器 "正文"                            # 带标签
 
 scripts/publish                                   # 构建并发布(不要直接 npm run build)
 

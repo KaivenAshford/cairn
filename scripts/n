@@ -5,6 +5,7 @@
 #   n -v public -t post -T "标题" "正文"
 #   echo "长内容" | n -v circle
 #   n -i now "在建这个站"            改写 id 为 now 的那条（不存在就建）
+#   n -g tsgo,编译器 "正文"          带标签（逗号分隔）
 #
 # 需要 CAIRN_URL 与 CAIRN_TOKEN（可放在 ~/.cairnrc 里 export）。
 set -euo pipefail
@@ -13,15 +14,16 @@ set -euo pipefail
 : "${CAIRN_URL:?未设置 CAIRN_URL}"
 : "${CAIRN_TOKEN:?未设置 CAIRN_TOKEN}"
 
-type="" visibility="" title="" status="" id=""
-while getopts "t:v:T:s:i:h" opt; do
+type="" visibility="" title="" status="" id="" tags=""
+while getopts "t:v:T:s:i:g:h" opt; do
   case "$opt" in
     t) type=$OPTARG ;;
     v) visibility=$OPTARG ;;
     T) title=$OPTARG ;;
     s) status=$OPTARG ;;
     i) id=$OPTARG ;;
-    h) sed -n '2,10p' "$0"; exit 0 ;;
+    g) tags=$OPTARG ;;
+    h) sed -n '2,11p' "$0"; exit 0 ;;
     *) exit 2 ;;
   esac
 done
@@ -38,14 +40,24 @@ fi
 if [ $# -gt 0 ]; then text="$*"; else text=$(cat); fi
 [ -n "${text//[[:space:]]/}" ] || { echo "空内容，没写。" >&2; exit 1; }
 
-payload=$(TEXT="$text" TYPE="$type" VIS="$visibility" TITLE="$title" STATUS="$status" ID="$id" \
+payload=$(TEXT="$text" TYPE="$type" VIS="$visibility" TITLE="$title" STATUS="$status" ID="$id" TAGS="$tags" \
   python3 -c '
-import json, os
+import json, os, re, sys
 d = {"text": os.environ["TEXT"]}
 for key, env in (("type", "TYPE"), ("visibility", "VIS"),
                  ("title", "TITLE"), ("status", "STATUS"), ("id", "ID")):
     if os.environ[env]:
         d[key] = os.environ[env]
+if os.environ["TAGS"]:
+    tags = [t.strip() for t in os.environ["TAGS"].split(",") if t.strip()]
+    # 和 server/write.go 的 tagSlug、web/src/lib/entries.ts 的 tagSlug 同一套规则。
+    # 在这里先挡一道是为了给出**当场能看懂的**报错：服务端也会拒（400），
+    # 但那时错误信息已经隔着一层 HTTP，而这条路径的全部意义就是低摩擦。
+    bad = [t for t in tags if not re.sub(r"[^\w]+", "", t, flags=re.UNICODE).strip("_")]
+    if bad:
+        sys.exit("标签里没有任何字母、数字或中文，做不出 URL 里的一段：" + repr(bad))
+    if tags:
+        d["tags"] = tags
 print(json.dumps(d, ensure_ascii=False))')
 
 curl -sS --fail-with-body -X POST "${CAIRN_URL%/}/api/write" \

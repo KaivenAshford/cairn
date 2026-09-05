@@ -41,6 +41,53 @@ export async function loadEntries(): Promise<Entry[]> {
     );
   }
 
+  // 标签会变成路由参数 `/t/<slug>/`，而路由参数在静态构建里就是 dist 下的目录名。
+  // 所以一个含 `/` 的标签是一条相对路径，一个 `..` 直接就往 dist 外面写——
+  // `/t/../index.html` 落在 dist 根上，正好盖掉首页。
+  // 「标签是我自己写的，不会有恶意」不构成理由：从手机上发一条
+  // `n -g "读书 笔记/2026"` 是手滑，不是攻击，而后果一样。
+  //
+  // 和上面那条 unlisted 文件名守卫一样**大声失败**，不静默规范化：
+  // 悄悄把 `a/b` 改写成 `a-b` 的话，两个本来不同的标签会合并成一页，而没人会发现。
+  // 只查会真正变成 URL 的那两层（public 进 /t/ 与条目页，unlisted 的条目页也印标签）；
+  // circle / private 的标签不进任何产物，不该让公开站构建不过。
+  const badTags: string[] = [];
+  const collided: string[] = [];
+  const seenSlug = new Map<string, string>(); // slug → 第一个用它的原文标签
+  for (const e of all) {
+    if (e.data.visibility !== 'public' && e.data.visibility !== 'unlisted') continue;
+    for (const tag of e.data.tags) {
+      const slug = tagSlug(tag);
+      if (slug === '') {
+        badTags.push(`  - ${e.id}：${JSON.stringify(tag)}`);
+        continue;
+      }
+      // 折叠不安全字符之后，两个不同的标签可能落到同一个 slug 上（`C#` 和 `C++` 都是 `c`）。
+      // 那会让两个标签共用一页、其中一个的名字凭空消失。宁可构建失败，让人改标签。
+      const prev = seenSlug.get(slug);
+      if (prev !== undefined && prev !== tag) {
+        collided.push(`  - ${JSON.stringify(prev)} 与 ${JSON.stringify(tag)} 都会变成 /t/${slug}/`);
+      } else {
+        seenSlug.set(slug, tag);
+      }
+    }
+  }
+  if (collided.length > 0) {
+    throw new Error(
+      `以下标签会挤进同一个页面：\n${[...new Set(collided)].join('\n')}\n\n` +
+        `标签里除字母、数字、中文以外的字符都会被折成 \`-\`，于是不同的标签可能撞成同一个 URL。\n` +
+        `改掉其中一个（比如 \`C#\` → \`csharp\`）。`,
+    );
+  }
+  if (badTags.length > 0) {
+    throw new Error(
+      `以下标签不能当作 URL 里的一段：\n${badTags.join('\n')}\n\n` +
+        `标签会变成 /t/<标签>/ 这个路由的参数，也就是 dist 下的目录名。\n` +
+        `含 \`/\`、为空、或者是 \`.\` / \`..\` 的标签会让产物落在意料之外的地方。\n` +
+        `把标签改成一个词（中文原样即可，空格会折成 -）。`,
+    );
+  }
+
   return all.sort((a, b) => b.data.created.getTime() - a.data.created.getTime());
 }
 
@@ -51,6 +98,83 @@ export async function publicEntries(): Promise<Entry[]> {
 
 export async function unlistedEntries(): Promise<Entry[]> {
   return (await loadEntries()).filter((e) => e.data.visibility === 'unlisted');
+}
+
+/* ── 标签 ─────────────────────────────────────────────────────────────────── */
+
+/**
+ * 标签 → URL 里的那一段（未编码）。
+ *
+ * 只做两件事：把首尾空白去掉、中间的空白折成 `-`，再把 ASCII 大写降成小写。
+ *
+ * **故意不做音译、不剥非 ASCII。** 剥掉的话，一个纯中文标签会变成空串，
+ * 于是「起居注」「排版」「编译器」全挤进同一页——而这个站的标签基本都是中文。
+ * 中文原样留在 slug 里，靠 URL 的百分号编码上路（见 tagHref）。
+ *
+ * 大写降小写是为了让 `Go` 和 `go` 落在同一页：标签是手打的，
+ * 同一个词因为大小写分成两页，等于标签没起作用。
+ * 代价是显示名要挑一个（见 publicTagIndex：取最先出现的那种写法）。
+ */
+export function tagSlug(tag: string): string {
+  return tag
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+/**
+ * 标签页的链接。**拼 URL 只走这一个口子。**
+ *
+ * 上面那条「只保留字母数字和中文」的规则是这里能成立的前提：
+ * Astro 写盘时会对路由参数做百分号编码，而**编码后的字符串就是盘上的目录名**——
+ * 标签 `C#` 会落成字面的 `c%23` 四个字符的目录，浏览器请求 /t/c%23/ 时
+ * 服务器把它解回 `/t/c#/`，于是 404。中文之所以没事，是因为 Astro 不编码非 ASCII，
+ * 盘上就是原文，编码后的 href 请求过来正好解回它。
+ */
+export function tagHref(tag: string): string {
+  return `/t/${encodeURIComponent(tagSlug(tag))}/`;
+}
+
+export interface TagGroup {
+  /** URL 里的那一段，未编码。也是 dist 下的目录名。 */
+  slug: string;
+  /** 显示用的原文。 */
+  name: string;
+  /** 这个标签下的条目，沿用时间流的倒序。 */
+  entries: Entry[];
+}
+
+/**
+ * 标签索引。**数据源只能是 publicEntries()。**
+ *
+ * 这不是风格问题：unlisted 条目的标签一旦聚进来，就会生成一个「这个标签下有 1 条」的
+ * 页面，上面印着那条 unlisted 的标题和 URL——而它的全部防护就是猜不到，
+ * 标签页却是猜得到的（`/t/读书/`）。一个公开页面把随机路径念出来，这层防护就没了。
+ * 见 ARCHITECTURE.md 第 2 节，以及 scripts/test-visibility 里对应的断言。
+ */
+export async function publicTagIndex(): Promise<TagGroup[]> {
+  const groups = new Map<string, TagGroup>();
+  // publicEntries() 已经按 created 倒序，插入顺序即展示顺序，不用再排一次。
+  for (const e of await publicEntries()) {
+    for (const tag of e.data.tags) {
+      const slug = tagSlug(tag);
+      let g = groups.get(slug);
+      if (!g) {
+        // 显示名取最先出现的那种写法：同一个 slug 下可能有 `Go` 和 `go`，
+        // 总得挑一个，挑「最新那条条目怎么写的」比挑字典序更贴近当下的写法。
+        g = { slug, name: tag.trim(), entries: [] };
+        groups.set(slug, g);
+      }
+      // 同一条条目把同一个标签写了两遍（`[Go, go]`）时只算一次，
+      // 否则它会在自己的标签页上出现两次。
+      if (!g.entries.includes(e)) g.entries.push(e);
+    }
+  }
+  // 条数多的在前，同条数按 slug 定序——顺序必须是确定的，否则每次构建的产物都不一样。
+  return [...groups.values()].sort(
+    (a, b) => b.entries.length - a.entries.length || a.slug.localeCompare(b.slug),
+  );
 }
 
 /** 去掉一行 markdown 的标记，只留文字。分隔线这类纯标记行会变成空串。 */
@@ -181,6 +305,50 @@ export function linkHost(entry: Entry): string | null {
   } catch {
     return null;
   }
+}
+
+export interface EntryImage {
+  src: string;
+  alt: string;
+}
+
+/**
+ * photo 条目正文里的第一张图，铺在时间流的卡片上。
+ *
+ * photo 是六型里唯一「拿到了颜色却没有结构分支」的一支：卡片上从不出现图像，
+ * 正文位置显示的是 excerpt 剥出来的 alt 文本——一张影像卡上印着「一张图的说明」，
+ * 而图不在。这个函数就是补上那个分支。
+ *
+ * **只认绝对路径（`/…`）和远程图（`https://…`），相对路径一律返回 null。**
+ * 这一条不是保守，是因为两条渲染路径不一样：
+ *   · `<Content />`（条目页）走 Astro 的图片管线，markdown 里的相对路径会被解析成
+ *     真实文件、压缩、加 hash，最后 src 指向 `/_astro/xxx.hash.webp`；
+ *   · 这里是拿正则从**正文原文**里抠出来的裸 src，一个字都没经过那条管线。
+ * 于是同一条 `![](./a.jpg)`，条目页上是好的，首页卡片上会指向 `/e/<id>/a.jpg`
+ * ——一个从来没被拷进 dist 的路径。**坏图比没有图更糟**：没有图只是少一块内容，
+ * 坏图是一个当场就露馅的破洞，而且它只在首页出现，改完条目页看一眼是发现不了的。
+ *
+ * 想让相对路径也能上卡片，正确的做法是走 `getImage()` 把它送进同一条管线，
+ * 而不是把裸 src 印出去。真需要时再做；在那之前，配图写成 `/img/…` 或图床 URL。
+ */
+export function firstImage(entry: Entry): EntryImage | null {
+  let inCode = false;
+  for (const raw of (entry.body ?? '').split('\n')) {
+    // 代码块里的 `![](…)` 是被展示的语法，不是这条条目的配图。
+    if (raw.trim().startsWith('```')) {
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode) continue;
+    // ![alt](src "title")：尖括号包裹和结尾的可选 title 都是 CommonMark 的合法写法，
+    // 不认的话 src 里会混进一个 `"` 和半句标题，直接写进 <img src>。
+    const m = raw.match(/!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+["'][^"']*["'])?\s*\)/);
+    if (!m) continue;
+    const src = m[2];
+    if (!/^(?:https?:)?\/\//.test(src) && !src.startsWith('/')) continue;
+    return { src, alt: m[1].trim() };
+  }
+  return null;
 }
 
 export const TYPE_LABEL: Record<string, string> = {

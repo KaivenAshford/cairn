@@ -9,7 +9,7 @@
 下面几条是已经拍板的,不需要重新讨论:
 
 1. **静态优先,按路由开动态。** 判断标准只有一条:这个页面的内容对每个访客是不是一样的?
-   一样 → 构建时生成;不一样(个性化/写入/实时/要算力)→ 走服务端。
+   一样 → 构建时生成;不一样(个性化/写入/实时)→ 走服务端。
 2. **可见度四层**:`public` / `unlisted` / `circle` / `private`。
    `circle` 和 `private` **根本不进静态构建产物**,由服务端现渲染。
    前端 `if (!loggedIn) return null` 等于零防护——字节已经下发了。
@@ -49,8 +49,8 @@
 
 ## 当前状态(2026-09-05)
 
-**基础做扎实了,视觉重做过一轮,出口和 CI 也补齐了。** circle / pipeline / 算力接口
-一律停在原地等审核。
+**基础做扎实了,视觉重做过一轮,出口和 CI 也补齐了。** circle 与 pipeline 停在原地等审核;
+算力接口已明确不做(见 ARCHITECTURE 第 7 节)。
 
 **内容与代码分仓**:真实条目在单独的 private 仓库(clone 到 `web/content/entries/`),
 代码仓里只有 `web/content/fixtures/` 那 3 条示例。详见 ARCHITECTURE.md 第 2 节。
@@ -75,8 +75,8 @@ URL 泄露给拿到其中一条的人。
 `server/` 24 个测试(`go test -race` 全过),`scripts/test-visibility` **81 条**性质。
 两套都做过变异验证——把修复改坏,确认测试真的会失败。
 
-**未实现,需要先过审再做**:`/circle/*` 的会话与渲染、magic link、`pipeline/` 的数据采集、
-算力接口、手机端写入入口、写入后自动重建。
+**未实现**:`/circle/*` 的会话与渲染、magic link、`pipeline/` 的数据采集、
+手机端写入入口(Telegram bot)、写入后自动重建。
 
 **已知的债**:
 - `.yearmark` 的 `position: sticky` 在 grid item 上活动范围只有自己那一行,

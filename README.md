@@ -22,7 +22,7 @@
 | `web/` | Astro 静态壳。构建时生成 `public` / `unlisted` 内容 |
 | `web/content/entries/` | 真实条目。**单独的 private 仓库**，本目录被 gitignore |
 | `web/content/fixtures/` | 几条示例，进代码仓。`scripts/seed` 把它们放进 `entries/` |
-| `server/` | Go 服务：写入通道、会话、（未来）算力接口 |
+| `server/` | Go 服务：写入通道、（未来）circle 的会话与渲染 |
 | `scripts/` | `n` 捕获、`seed` 灌示例、`publish` 构建发布、`test-visibility` 性质测试 |
 | `pipeline/` | 定时数据采集，产出 JSON 给构建用 |
 | `deploy/` | docker compose + Caddy，部署步骤见 [deploy/README.md](deploy/README.md) |

@@ -18,6 +18,7 @@ cd "$(dirname "$0")/.." || exit 1
 ENTRIES=web/content/entries
 AI_JSON=web/src/data/ai.json
 AI_BACKUP=""
+PF_TMP=""
 declare -a MADE=()
 fails=0
 
@@ -31,6 +32,10 @@ cleanup() {
   # 而这件事在 diff 里看不出来，只在 `git status` 的 mode 变更里闪一下。
   [ -n "${AI_BACKUP:-}" ] && [ -f "$AI_BACKUP" ] && cp "$AI_BACKUP" "$AI_JSON" && rm -f "$AI_BACKUP"
   rm -rf "$ENTRIES/2026"
+  # 第 22 组会在 /tmp 下造几份最小仓库给 scripts/preflight 检查。中途失败或被 Ctrl-C
+  # 的话，那几份里带着 .env（内容是假的，但形状是真的）——不清掉就是在 /tmp 里
+  # 留一堆看起来像凭证的文件。
+  [ -n "${PF_TMP:-}" ] && rm -rf "$PF_TMP"
   # 测试里那些**故意失败**的构建已经清空过 docroot，并留下一批含条目正文的中间 chunk。
   # 先整个删掉再走安全发布路径：宁可 dist 是空的，也不能是「空的 + 泄露的 .mjs」。
   # 失败要喊出来，不能用 `|| true` 咽掉——那正是这个脚本在防的事。
@@ -1372,6 +1377,459 @@ cp "$AI_BACKUP" "$AI_JSON"        # cp 而不是 mv，理由见 cleanup()
 rm -f "$AI_BACKUP"
 AI_BACKUP=""
 
+
+# ── 22. scripts/preflight：查部署前置条件的那个脚本，它自己也要有人查 ─────────
+#
+# preflight 把 deploy/README.md 的「容易踩的几脚」变成了可执行检查。而一个自检脚本
+# 最坏的失败方式不是报错，是**静默地什么都没查还亮绿灯**——scripts/deploy 会把那个
+# 退出码 0 当成「查过了，没问题」，然后接着往下装。它查的那些东西（compose 的 volumes、
+# ports、Caddyfile 的站点地址）又恰好都在改，一个只认旧写法的解析器不会报错，
+# 只会少打印几行。所以这一组查三件事：在这台机器上跑不崩、该报的报得出来、
+# 退出码的语义确实是「致命条数」。
+#
+# 注意断言的**不是「preflight 通过」**：这个工作区没有 .env、没有 docker，
+# preflight 一定会报一串错，那是对的。查的是它报得对不对。
+PF_TMP=$(mktemp -d)
+
+# 造一份「除了要故意弄坏的地方之外都对」的最小仓库。preflight 的 --root 就是为它准备的：
+# 不这么做的话，这些断言就只能在真仓库上跑，而真仓库的状态（有没有 .env、uid 是多少）
+# 每台机器都不一样——那样的断言在别人机器上要么假绿要么假红。
+pf_fixture() { # pf_fixture <目录>
+  local d=$1
+  mkdir -p "$d/deploy" "$d/web/content/entries"
+  cp deploy/docker-compose.yml deploy/Caddyfile "$d/deploy/"
+  # 顺手把占位域名换掉：域名那一节不是这一组要测的东西，让它安静。
+  sed 's#https://example\.com#https://pf.test#' web/astro.config.mjs > "$d/web/astro.config.mjs"
+  {
+    echo "CAIRN_TOKEN=$(openssl rand -hex 32)"
+    echo "CAIRN_UID=$(id -u)"
+    echo "CAIRN_GID=$(id -g)"
+    echo "CAIRN_DOMAIN=pf.test"
+    echo "CAIRN_URL=https://pf.test"
+  } > "$d/.env"
+  chmod 600 "$d/.env"
+}
+
+# pf <参数...> —— 跑一次 preflight，输出进 $pf_out、退出码进 $pf_rc、stderr 进 $pf_err
+pf() {
+  local errf="$PF_TMP/stderr"
+  pf_out=$(scripts/preflight "$@" 2>"$errf"); pf_rc=$?
+  pf_err=$(cat "$errf")
+}
+pf_fatals() { printf '%s\n' "$pf_out" | grep -c '✗'; }
+
+# —— 在这台机器上、这个真仓库上，跑不崩 ——
+# 「不崩」不等于「退出码不是 1」：set -u 下引用一个没赋值的变量会让 bash 当场退出，
+# 而那时它已经打印了半份报告，退出码还可能恰好落在 0-63 里像个正常结果。
+# 所以查的是 stderr 干净、六节都跑到了、最后一行是总结。
+pf --offline
+if [ -n "$pf_err" ]; then
+  bad "preflight 往 stderr 上吐了东西（多半是脚本自己崩了）：$(printf '%s' "$pf_err" | head -3 | tr '\n' ' ')"
+else
+  ok "preflight 在这台机器上跑完，stderr 是干净的"
+fi
+missing=""
+for want in "工具与守护进程：" "端口：" ".env：" "内容目录：" "域名：" "构建与磁盘："; do
+  printf '%s\n' "$pf_out" | grep -qF "$want" || missing="$missing $want"
+done
+if [ -z "$missing" ]; then
+  ok "preflight 六节都跑到了（中途没被一个 set -u 打断）"
+else
+  bad "preflight 少了这几节:$missing —— 它多半是在中间挂了，而不是查完了"
+fi
+if printf '%s\n' "$pf_out" | tail -1 | grep -qE '(全部通过|条警告|条致命)'; then
+  ok "preflight 走到了最后的总结行"
+else
+  bad "preflight 没有打印总结行：$(printf '%s\n' "$pf_out" | tail -1)"
+fi
+
+# —— 退出码 = 致命条数，警告不算 ——
+# 这条不写死数字，直接拿输出里 ✗ 的条数去比。写死数字的话，往 preflight 里加一条检查
+# 就得来改这里，改法又只有「把 3 改成 4」这一种——那不是断言，是抄答案。
+if [ "$pf_rc" = "$(pf_fatals)" ]; then
+  ok "preflight 的退出码（$pf_rc）等于 ✗ 的条数（这个仓库现在没有 .env、没有 docker，报错是对的）"
+else
+  bad "preflight 退出码是 $pf_rc，而输出里有 $(pf_fatals) 条 ✗ —— 退出码的语义对不上"
+fi
+
+# —— 该报「没有 docker」的时候报得出来 ——
+# 造一个只缺 docker 的 PATH：把当前 PATH 里每个可执行文件都软链进一个临时目录，
+# 唯独跳过 docker。为什么不直接把 PATH 清空——那样 sed / awk / git 也一起没了，
+# 脚本会因为别的原因崩掉，而这条断言照样绿：它只查「有没有那句话」。
+# 这么绕还有一个好处：在**装了 docker** 的机器上（比如部署那台）这条同样跑得动。
+pf_shim="$PF_TMP/bin"
+mkdir -p "$pf_shim"
+for d in ${PATH//:/ }; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*; do
+    b=${f##*/}
+    [ "$b" = docker ] && continue
+    [ -e "$pf_shim/$b" ] || ln -s "$f" "$pf_shim/$b" 2>/dev/null
+  done
+done
+pf_fixture "$PF_TMP/nodocker"
+out=$(PATH="$pf_shim" scripts/preflight --root "$PF_TMP/nodocker" --offline --only tools 2>&1); rc=$?
+if printf '%s\n' "$out" | grep -qF "没有 docker" && [ "$rc" -ge 1 ]; then
+  ok "PATH 里没有 docker 时，preflight 报「没有 docker」并以非零退出（$rc）"
+else
+  out=$(printf '%s' "$out" | tr '\n' ' '); bad "PATH 里没有 docker 时 preflight 没报出来（退出码 $rc）：${out:0:160}"
+fi
+
+# —— 一份哪儿都对的配置：0 条致命，但有警告，而警告不能把退出码带偏 ——
+pf_fixture "$PF_TMP/good"
+
+# —— Caddyfile 里的 {$CAIRN_DOMAIN} 必须传给 caddy validate ——
+# 不传就直接验的话，Caddy 报的是「unrecognized global option: encode」：站点地址那一行
+# 空了，整个块被当成全局选项块解析。这句报错和真正的原因（域名没配）完全对不上，
+# 而「症状和原因对不上」正是 preflight 要消灭的东西——它自己造一个就更说不过去。
+# 用一个假的 caddy 来验：真 caddy 是容器里的东西，不能要求每台跑测试的机器上都有一个。
+pf_fake="$PF_TMP/fakebin"; mkdir -p "$pf_fake"
+cat > "$pf_fake/caddy" <<'FAKECADDY'
+#!/bin/sh
+[ "$1" = validate ] || exit 0
+[ -n "${CAIRN_DOMAIN:-}" ] || { echo "Error: unrecognized global option: encode" >&2; exit 1; }
+echo "Valid configuration"
+FAKECADDY
+chmod +x "$pf_fake/caddy"
+out=$(PATH="$pf_fake:$PATH" scripts/preflight --root "$PF_TMP/good" --offline --only build 2>&1)
+if printf '%s\n' "$out" | grep -qF "caddy validate 通过"; then
+  ok "preflight 把 .env 里的 CAIRN_DOMAIN 传给了 caddy validate"
+else
+  bad "preflight 没把域名传给 caddy validate：$(printf '%s\n' "$out" | grep -i caddy | tr '\n' ' ' | head -c 200)"
+fi
+pf_fixture "$PF_TMP/nodomain"
+sed 's/^CAIRN_DOMAIN=.*/CAIRN_DOMAIN=/' "$PF_TMP/nodomain/.env" > "$PF_TMP/nodomain/.env.new"
+mv "$PF_TMP/nodomain/.env.new" "$PF_TMP/nodomain/.env"
+out=$(PATH="$pf_fake:$PATH" scripts/preflight --root "$PF_TMP/nodomain" --offline --only build 2>&1)
+if printf '%s\n' "$out" | grep -qF "caddy validate 不通过"; then
+  bad "域名还空着时，preflight 报了「caddy validate 不通过」——这会把人带去查 Caddyfile 的语法，而语法没问题"
+elif printf '%s\n' "$out" | grep -qF "跳过 caddy validate"; then
+  ok "域名还空着时 preflight 跳过 validate 并说明原因，而不是照抄那句对不上的报错"
+else
+  bad "域名还空着时 preflight 对 caddy validate 什么都没说"
+fi
+pf --root "$PF_TMP/good" --offline --only env,content,domain
+if [ "$pf_rc" -eq 0 ] && printf '%s\n' "$pf_out" | grep -q '!'; then
+  ok "配置都对时 preflight 退 0，尽管还有警告（警告不计入退出码：DNS 没生效可以先部署后解析）"
+elif [ "$pf_rc" -ne 0 ]; then
+  d=$(printf '%s\n' "$pf_out" | grep -A2 '✗' | head -6 | tr '\n' ' '); bad "一份哪儿都对的配置被 preflight 判了 $pf_rc 条致命：${d:0:200}"
+else
+  bad "这份 fixture 一条警告都没有，「警告不影响退出码」那条断言是空转的"
+fi
+
+# —— 三个故意的错，要一个不漏地点名 ——
+# 这三条都是 deploy/README.md 里「容易踩的几脚」，共同点是症状和原因对不上：
+# 全都表现为「容器无限重启」或「每条写入 500」，而日志里的那句话只在容器里。
+pf_fixture "$PF_TMP/broken"
+sed -i.bak 's/^CAIRN_TOKEN=.*/CAIRN_TOKEN=tooshort/; s/^CAIRN_UID=.*/CAIRN_UID=nobody/' "$PF_TMP/broken/.env"
+rm -f "$PF_TMP/broken/.env.bak"
+echo 'CAIRN_TELEGRAM_ALLOW=12345678' >> "$PF_TMP/broken/.env"   # 只配一个 = 半配
+pf --root "$PF_TMP/broken" --offline --only env
+hit=0
+for pat in "CAIRN_TOKEN 只有" "Telegram 只配了一个" "CAIRN_UID / CAIRN_GID 不是纯数字"; do
+  printf '%s\n' "$pf_out" | grep -qF "$pat" || { bad "preflight 没报出「$pat」这一类的错"; hit=1; }
+done
+[ "$hit" -eq 0 ] && ok "token 太短、Telegram 半配、uid 不是数字，三个都被点名"
+if [ "$pf_rc" -eq 3 ] && [ "$pf_rc" = "$(pf_fatals)" ]; then
+  ok "三个错 → 退出码 3（不是「1」也不是「有问题」，是条数）"
+else
+  bad "三个故意的错，preflight 退出码是 $pf_rc、✗ 有 $(pf_fatals) 条"
+fi
+
+# —— uid 对不上：那个 500 的根因 ——
+# 它是这几脚里最难自己看出来的一脚，所以单独钉一条。
+pf_fixture "$PF_TMP/uid"
+sed "s/^CAIRN_UID=.*/CAIRN_UID=$(( $(id -u) + 12345 ))/" "$PF_TMP/uid/.env" > "$PF_TMP/uid/.env.new"
+mv "$PF_TMP/uid/.env.new" "$PF_TMP/uid/.env"
+pf --root "$PF_TMP/uid" --offline --only content
+if printf '%s\n' "$pf_out" | grep -q '500' && printf '%s\n' "$pf_out" | grep -q 'chown'; then
+  ok "内容目录属主和 CAIRN_UID 对不上时，preflight 说出了症状（500）也给了修法（chown）"
+else
+  bad "uid 对不上时 preflight 没把「每条写入 500」和「怎么改」说清楚"
+fi
+
+# —— 内容目录不能整个进到 Caddy 那个容器里 ——
+# compose 把 web/ 整层挂进 caddy（挂 dist 会被 publish 的 rename 坑），于是 web/content/
+# 底下那些四层可见度的真实条目也跟着进去了，要靠一层空 tmpfs 盖住。
+# 「Caddyfile 的 root 指向 dist，本来就发不出去」不能算数——那是软的，一行配置写错就破了；
+# 「根本不在这个容器里」才是硬的。这和第 1 组「private 不进 dist」是同一条性质，
+# 只是发生在部署层：字节不该出现在不需要它的地方。
+pf_fixture "$PF_TMP/shadow"
+sed 's#\(target:[[:space:]]*/.*\)/content$#\1/content-nowhere#' \
+    "$PF_TMP/shadow/deploy/docker-compose.yml" > "$PF_TMP/shadow/deploy/dc.new"
+if cmp -s "$PF_TMP/shadow/deploy/dc.new" "$PF_TMP/shadow/deploy/docker-compose.yml"; then
+  bad "造不出「遮蔽挂错地方」这个变异（compose 里的 tmpfs target 换写法了？），下面这条断言没有真的跑"
+else
+  mv "$PF_TMP/shadow/deploy/dc.new" "$PF_TMP/shadow/deploy/docker-compose.yml"
+  pf --root "$PF_TMP/shadow" --offline --only content
+  if [ "$pf_rc" -ge 1 ] && printf '%s\n' "$pf_out" | grep -q '遮蔽'; then
+    ok "遮蔽挂到了别处时 preflight 报致命（内容目录会整个出现在 Caddy 容器里）"
+  else
+    bad "遮蔽挂错地方，preflight 却放行了（退出码 $pf_rc）"
+  fi
+fi
+# 变异的另一半：没动过的那份必须是绿的，否则上面那条只是「总在报错」。
+pf --root "$PF_TMP/good" --offline --only content
+if printf '%s\n' "$pf_out" | grep -q '盖住了'; then
+  ok "没动过的 compose 上，preflight 认出内容目录被 tmpfs 盖住了"
+else
+  bad "preflight 在正常的 compose 上没认出那层遮蔽——它多半根本没解析到 volumes"
+fi
+
+# —— --only 写错必须停下来，不能默默跑零条检查然后报「全部通过」——
+if scripts/preflight --only nosuchsection >/dev/null 2>&1; then
+  bad "--only 写了个不存在的节名，preflight 居然退了 0"
+else
+  rc=$?; [ "$rc" -eq 64 ] && ok "--only 写错时退 64（用法错误，和「64 条致命」撞不上：致命数封在 63）" \
+                          || bad "--only 写错时退的是 $rc，不是 64"
+fi
+
+# —— 它必须是只读的。一个「部署前自检」如果会改东西，人就不敢在出问题时随手跑它，
+#    而那正是最需要跑它的时刻。
+before=$(find "$PF_TMP/good" | sort)
+pf --root "$PF_TMP/good" --offline
+after=$(find "$PF_TMP/good" | sort)
+if [ "$before" = "$after" ]; then
+  ok "preflight 跑完之后一个文件都没多、没少（写权限探针自己清掉了）"
+else
+  d=$(diff <(echo "$before") <(echo "$after") | tr '\n' ' '); bad "preflight 动了被检查的目录：${d:0:160}"
+fi
+
+# —— 探针必须**被打断时**也留不下东西 ——
+# 会留下文件的恰恰是没走到「rm 一下」那一行的那一次：Ctrl-C、`timeout`（发 SIGTERM）、
+# CI 超时被杀。留下的后果不是「多一个文件」：内容目录是一个 git 仓库，一个未跟踪的
+# 文件就让 `git status --porcelain` 非空，而 scripts/deploy 看到它非空就**跳过
+# git pull**，并说「那多半是刚落盘还没 commit 的条目」——内容仓从此静默不再更新。
+# 变异验证：直接造一个上次留下的探针，preflight 必须把它扫掉。
+touch "$PF_TMP/good/web/content/entries/.preflight-probe-99999"
+pf --root "$PF_TMP/good" --offline --only content
+if [ -e "$PF_TMP/good/web/content/entries/.preflight-probe-99999" ]; then
+  bad "上次留下的写权限探针没被扫掉 —— 内容仓会一直是 dirty，scripts/deploy 会永远跳过 git pull"
+elif printf '%s\n' "$pf_out" | grep -q '探针'; then
+  ok "上次没删干净的写权限探针被扫掉了，而且说了它为什么要紧"
+else
+  bad "探针扫掉了，但一声没吭 —— 人不会知道上一次自检是被打断的"
+fi
+if grep -q 'trap drop_probe EXIT' scripts/preflight; then
+  ok "探针的收尾挂在 EXIT trap 上（被 SIGTERM 打断也清得掉）"
+else
+  bad "preflight 里没有 EXIT trap 收探针：被 timeout / Ctrl-C 打断就会留下一个"
+fi
+
+# —— 通配符域名：能签证书 ≠ 能拼进链接 ——
+# CAIRN_URL 和 astro 的 site 是**要被拼进链接**的地址（canonical、og:url、sitemap 的
+# <loc>、Telegram 的确认链接）。https://*.example.org/ 谁也打不开，而构建不会失败，
+# 它照样出整站——真正停下来的地方是三分钟后「首页拿不到 200」，原因写的却是
+# 「证书签不下来」。所以这一条必须在 preflight 就拦住。
+sed -i.bak 's#^CAIRN_URL=.*#CAIRN_URL=https://*.pf.test#; s#^CAIRN_DOMAIN=.*#CAIRN_DOMAIN=*.pf.test#' "$PF_TMP/good/.env"
+rm -f "$PF_TMP/good/.env.bak"
+sed -i.bak "s#^const site = .*#const site = 'https://*.pf.test';#" "$PF_TMP/good/web/astro.config.mjs"
+rm -f "$PF_TMP/good/web/astro.config.mjs.bak"
+pf --root "$PF_TMP/good" --offline --only domain
+if [ "$pf_rc" -ge 1 ] && printf '%s\n' "$pf_out" | grep -q '通配符'; then
+  ok "CAIRN_URL / site 里的通配符被 preflight 报成致命（canonical 会指向一个打不开的主机）"
+else
+  bad "通配符域名进了 CAIRN_URL / site，preflight 却放行了（退出码 $pf_rc）"
+fi
+# 变异的另一半：换成具体域名必须不再报，否则上面那条只是「总在报错」。
+sed -i.bak 's#^CAIRN_URL=.*#CAIRN_URL=https://pf.test#; s#^CAIRN_DOMAIN=.*#CAIRN_DOMAIN=pf.test *.pf.test#' "$PF_TMP/good/.env"
+rm -f "$PF_TMP/good/.env.bak"
+sed -i.bak "s#^const site = .*#const site = 'https://pf.test';#" "$PF_TMP/good/web/astro.config.mjs"
+rm -f "$PF_TMP/good/web/astro.config.mjs.bak"
+pf --root "$PF_TMP/good" --offline --only domain
+if printf '%s\n' "$pf_out" | grep -q '通配符'; then
+  bad "把通配符挪到第二个之后 preflight 还在报 —— 它拦的是「有没有 *」，不是「第一个是不是 *」"
+else
+  ok "通配符放在第二个（只给 Caddy 签证书用）时不报，第一个是具体域名就行"
+fi
+
+# —— shell 里 export 的同名变量会盖掉 .env ——
+# compose 的**变量插值**取「shell 环境 > --env-file」，而 environment: 段又优先于
+# env_file——于是 .env 里那一行完全不起作用，值却看着好好的。这是实测出来的
+# （compose v2.39.1），不是照文档写的，所以要有断言钉住 preflight 认得出它。
+pf_shadow_out=$(TZ=Zz/Mutant scripts/preflight --root "$PF_TMP/good" --offline --only env 2>&1)
+if printf '%s\n' "$pf_shadow_out" | grep -q 'TZ'; then
+  ok "shell 里 export 了 TZ 时 preflight 点名说它会盖掉 .env（症状是条目日期差一天）"
+else
+  bad "shell 里 export 的 TZ 会盖掉 .env，preflight 一声没吭"
+fi
+
+# ── 23. scripts/deploy：一键部署脚本自己的性质 ───────────────────────────────
+#
+# 这个脚本会装东西、会 clone、会起容器、会把密钥写进 .env。它错一次的代价比别的脚本
+# 都大，而它又是**最难在开发机上跑一遍**的（这里没有 docker、没有公网域名）。
+# 所以只断言那些不需要真 docker 就能证伪的性质：dry-run 的「一个字节都不改」、
+# 域名替换的三种走法、通配符、以及密钥不上屏。起容器之后的行为这里一条都验不了，
+# 那些断言写在 scripts/deploy 自己的「逐个端点验活」里，只有在真服务器上才跑得到。
+echo
+
+dp_out=$(scripts/deploy --help 2>&1)
+if printf '%s\n' "$dp_out" | grep -q 'dry-run'; then
+  ok "scripts/deploy --help 打得出用法（--dry-run 在里面）"
+else
+  bad "scripts/deploy --help 没打出用法：$(printf '%s' "$dp_out" | head -1)"
+fi
+
+# —— 不认识的参数必须退 64，不能「猜一个默认值往下走」——
+if scripts/deploy --no-such-flag >/dev/null 2>&1; then
+  bad "scripts/deploy 收到不认识的参数居然退了 0"
+else
+  rc=$?; [ "$rc" -eq 64 ] && ok "不认识的参数退 64（用法错误，和别的退出码撞不上）" \
+                          || bad "不认识的参数退的是 $rc，不是 64"
+fi
+
+# 造一份最小仓库。内容目录先 git init 好：不这么做的话脚本会**停下来问**
+# 「内容私有仓的 git 地址」——那是它该做的事（宁可停下来问），但会把这一组挂住。
+DP_TMP=$(mktemp -d)
+mkdir -p "$DP_TMP/repo/deploy" "$DP_TMP/repo/scripts" "$DP_TMP/repo/web/content/entries"
+cp deploy/docker-compose.yml deploy/Caddyfile "$DP_TMP/repo/deploy/"
+cp scripts/deploy scripts/preflight scripts/publish "$DP_TMP/repo/scripts/"
+cp web/astro.config.mjs "$DP_TMP/repo/web/"
+git -C "$DP_TMP/repo/web/content/entries" init -q
+
+# —— --dry-run 必须一个字节都不改 ——
+# 这是它唯一的承诺，也是这台机器上唯一一条能真验的。做法是按内容哈希 + 类型 + 权限 +
+# 大小做全树指纹，跑完再取一次，逐字节比。注意 preflight 是**留着**的：dry-run 会真的
+# 调它一次，而 preflight 是这条路径上唯一会往磁盘写东西的一环（内容目录里的写权限
+# 探针）。把它拿掉再测，等于绕开了唯一一个可能违约的地方。
+dp_snap() { (cd "$DP_TMP/repo" && find . -type f -exec sha256sum {} + 2>/dev/null | sort
+             cd "$DP_TMP/repo" && find . -printf '%p\t%y\t%m\t%s\n' 2>/dev/null | sort); }
+dp_before=$(dp_snap)
+"$DP_TMP/repo/scripts/deploy" --dry-run --no-telegram </dev/null >"$DP_TMP/out" 2>&1
+dp_after=$(dp_snap)
+if [ "$dp_before" = "$dp_after" ]; then
+  ok "scripts/deploy --dry-run 跑完，仓库逐字节没变（内容、类型、权限、大小都比过）"
+else
+  bad "scripts/deploy --dry-run 改了东西：$(diff <(printf '%s\n' "$dp_before") <(printf '%s\n' "$dp_after") | tr '\n' ' ' | cut -c1-200)"
+fi
+dp_left=""
+for f in .env web/dist web/astro.config.mjs.bak; do
+  [ -e "$DP_TMP/repo/$f" ] && dp_left="$dp_left $f"
+done
+[ -z "$dp_left" ] && ok "--dry-run 没生成 .env、没构建 dist、没留下 sed 的 .bak" \
+                  || bad "--dry-run 留下了：$dp_left"
+# 而且它得**说出**打算做什么，否则「什么都没改」是靠什么都没做换来的。
+if grep -q '生成.*\.env' "$DP_TMP/out" && grep -q 'docker compose' "$DP_TMP/out"; then
+  ok "--dry-run 把要做的事列了出来（生成 .env、起容器都在计划里）"
+else
+  bad "--dry-run 什么都没改，但也几乎什么都没说——那不是 dry-run，是空跑"
+fi
+
+# —— 下面几条要走到「占位域名」那一步，而那一步在「手边的工具」后面。
+#    这台机器上多半没有 docker，脚本会在第一步就正确地停下来（那是对的行为，
+#    上面 preflight 那一组已经断言过「没有 docker 要报出来」）。所以给它一个只会
+#    回答版本号的假 docker，把测试的焦点留在域名替换上。假 docker 一个容器也起不了，
+#    脚本会在后面的 npm ci 那步失败——那正好，我们要看的东西在那之前。
+DP_BIN="$DP_TMP/bin"; mkdir -p "$DP_BIN"
+cat > "$DP_BIN/docker" <<'DOCKERSTUB'
+#!/bin/sh
+case "$1 $2" in
+  "compose version") [ "$3" = --short ] && echo 0.0.0-stub || echo "Docker Compose version v0.0.0-stub"; exit 0 ;;
+esac
+case "$1" in
+  --version) echo "Docker version 0.0.0-stub, build stub"; exit 0 ;;
+  info) [ "$2" = --format ] && echo 0.0.0-stub; exit 0 ;;
+esac
+exit 0
+DOCKERSTUB
+chmod +x "$DP_BIN/docker"
+# 自检也从 fixture 里拿掉：它单独有一组（第 22 组），而留着它只会让这几条跑得很慢
+# （它要查 DNS、要探公网 IP），却验不到任何新东西。
+rm -f "$DP_TMP/repo/scripts/preflight"
+
+dp_site() { sed -n "s/^const site = ['\"]\([^'\"]*\)['\"].*/\1/p" "$DP_TMP/repo/web/astro.config.mjs" | head -1; }
+dp_run() { PATH="$DP_BIN:$PATH" "$DP_TMP/repo/scripts/deploy" "$@" </dev/null 2>&1; }
+
+# (a) 还是占位符 → 换掉
+dp_run --domain dp.test --no-telegram >/dev/null
+if [ "$(dp_site)" = "https://dp.test" ]; then
+  ok "占位域名会被换成真域名，而且换完读回来核对过"
+else
+  bad "占位域名没换成：site 现在是「$(dp_site)」"
+fi
+# (b) 已经是这个域名 → 幂等，一个字不动。文本替换是整条部署链上最脆的一环：
+#     改过一次之后再跑一遍，sed 要么找不到占位符，要么把真域名换成另一个。
+dp_h=$(sha256sum "$DP_TMP/repo/web/astro.config.mjs")
+dp_run --domain dp.test --no-telegram >/dev/null
+if printf '%s' "$dp_h" | sha256sum -c - >/dev/null 2>&1; then
+  ok "第二次跑不动 astro.config.mjs（幂等：域名已经换过就跳过）"
+else
+  bad "第二次跑又改了 astro.config.mjs —— 一键脚本最容易写错的就是这里"
+fi
+# (c) 有人手改成了另一个真域名 → 必须停下来问，绝不覆盖。
+#     两个域名不一致时站是通的，只是每一页都在把权重送给另一个——最难自己发现的那种。
+sed -i.bak "s#^const site = .*#const site = 'https://someone-else.test';#" "$DP_TMP/repo/web/astro.config.mjs"
+rm -f "$DP_TMP/repo/web/astro.config.mjs.bak"
+dp_o=$(dp_run --domain dp.test --no-telegram)
+if [ "$(dp_site)" = "https://someone-else.test" ] && printf '%s\n' "$dp_o" | grep -q '既不是占位符'; then
+  ok "site 是另一个真域名时停下来问，不覆盖（这一条只有停下来是对的）"
+else
+  bad "site 是 https://someone-else.test 时脚本把它覆盖了或者没说清楚：现在是「$(dp_site)」"
+fi
+cp web/astro.config.mjs "$DP_TMP/repo/web/astro.config.mjs"
+
+# —— 第一个域名是通配符 → 拒绝。CAIRN_URL / site / 验活时 curl 的地址都从第一个来，
+#    而 https://*.example.org/ 谁也打不开；构建**不会**因此失败（照样出整站），
+#    所以只能在这里拦。理由见 deploy/README 的「容易踩的几脚」。
+rm -f "$DP_TMP/repo/.env"
+dp_o=$(dp_run --domain '*.dp.test' --no-telegram)
+if printf '%s\n' "$dp_o" | grep -q '通配符' && [ ! -f "$DP_TMP/repo/.env" ]; then
+  ok "第一个域名是通配符时拒绝往下走，也没写出一份带 https://*.… 的 .env"
+else
+  bad "第一个域名是通配符却放行了 —— canonical 会指向一个打不开的主机，而构建不报错"
+fi
+# 变异的另一半：具体域名在前、通配符在后必须放行（那是给 Caddy 签证书用的，合法）。
+dp_o=$(dp_run --domain 'dp.test *.dp.test' --no-telegram)
+if printf '%s\n' "$dp_o" | grep -q '通配符'; then
+  bad "通配符放在第二个也被拒了 —— 它拦的是「有没有 *」，不是「第一个是不是 *」"
+else
+  ok "具体域名在前、通配符在后放行（Caddy 拿整串签证书，别的地方只用第一个）"
+fi
+
+# —— 生成的密钥不能出现在终端上。它会进 tee 出来的部署日志、进 CI 的 artifact、
+#    进任何一次「把输出贴给别人看」。
+rm -f "$DP_TMP/repo/.env"
+dp_o=$(dp_run --domain dp.test --no-telegram)
+dp_tok=$(sed -n 's/^CAIRN_TOKEN=//p' "$DP_TMP/repo/.env" 2>/dev/null | head -1)
+if [ ${#dp_tok} -ne 64 ]; then
+  bad "脚本没写出一个 64 位的 CAIRN_TOKEN，下面「密钥没回显」那条断言等于没跑"
+elif printf '%s' "$dp_o" | grep -qF "$dp_tok"; then
+  bad "生成的 CAIRN_TOKEN 出现在了终端输出里 —— 它会进部署日志、进 CI 的 artifact"
+else
+  ok "生成的 CAIRN_TOKEN 一个字符都没出现在终端输出里（只在 .env 里）"
+fi
+dp_mode=$(stat -c %a "$DP_TMP/repo/.env" 2>/dev/null || stat -f %Lp "$DP_TMP/repo/.env" 2>/dev/null)
+if [ "$dp_mode" = 600 ]; then
+  ok ".env 的权限是 600（同机器上别的用户读不到那两个密钥）"
+else
+  bad ".env 的权限是 $dp_mode，不是 600"
+fi
+# 第二次跑必须原样复用那个 token：重新生成不会报错，只会让所有客户端和 bot 同时静默失效。
+dp_run --domain dp.test --no-telegram >/dev/null
+if [ "$(sed -n 's/^CAIRN_TOKEN=//p' "$DP_TMP/repo/.env" | head -1)" = "$dp_tok" ]; then
+  ok "第二次跑不重新生成 CAIRN_TOKEN（重新生成 = 写入通道和 bot 一起静默失效）"
+else
+  bad "第二次跑把 CAIRN_TOKEN 换掉了 —— 所有 ~/.cairnrc 和 CI 里配着的那个就此失效"
+fi
+rm -rf "$DP_TMP"
+
+rm -rf "$PF_TMP"
+PF_TMP=""
+
+
+# ── 两份 envget 必须保持同一套逻辑 ──────────────────────────────────────────
+# scripts/deploy 和 scripts/preflight 各抄了一份同样的 awk（deploy 会调 preflight，
+# source 它会把它跑一遍，所以没法共用）。抄的理由成立，但抄出来的东西会漂移，
+# 而漂移的后果是「preflight 说配好了，deploy 读出来是空的」——两边都不报错。
+# 只比逻辑，不比注释：注释本来就该各写各的。
+strip_comments() { grep -v '^\s*#' | sed 's/[[:space:]]*#.*$//' | sed '/^[[:space:]]*$/d'; }
+grab_envget() { sed -n '/^envget()/,/^}/p' "$1" | strip_comments; }
+if [ "$(grab_envget scripts/deploy | md5sum)" = "$(grab_envget scripts/preflight | md5sum)" ]; then
+  ok "scripts/deploy 与 scripts/preflight 的 envget 逻辑一致"
+else
+  bad "两份 envget 漂移了 —— preflight 说配好了、deploy 读出来是空的，而两边都不报错"
+  diff <(grab_envget scripts/deploy) <(grab_envget scripts/preflight) | sed 's/^/      /' >&2
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then

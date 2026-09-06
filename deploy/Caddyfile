@@ -1,12 +1,45 @@
-# 换成你的域名。Caddy 会自动签发并续期证书。
-example.com {
+# 站点域名从环境变量来，不写死在这里。
+#
+# 理由是**文本替换是整条部署链上最脆的一环**：一键脚本要改这一行就得 sed，
+# 而 sed 只在「文件还是出厂那样」时是对的——换过一次域名之后再跑一次脚本，
+# 它要么找不到 example.com（静默什么都不做），要么把真域名替换成另一个。
+# 症状是 Caddy 去给一个谁也没在用的域名签证书，站打不开，而配置文件看着完全正常。
+# 值由 deploy/docker-compose.yml 传进容器（CAIRN_DOMAIN，没配就拒绝启动）。
+#
+# 要多域名就用**空格**分隔（实测 CAIRN_DOMAIN="a.example b.example" 会注册成两个 host）；
+# 逗号不行，Caddy 会直说「Site addresses cannot contain a comma」。
+#
+# 没传进来（或传了空串）时 Caddy 会**拒绝启动**——但它报的是
+# `unrecognized global option: encode`：地址空了，这个块就被当成全局选项块解析了。
+# 这个报错和真正的原因对不上，所以在这里记一笔；正常情况下轮不到它，
+# compose 那边的 `${CAIRN_DOMAIN:?}` 会先用一句人话拦住。
+#
+# 演练部署时把 CAIRN_DOMAIN 设成 localhost：Caddy 对 localhost 用内置 CA 签，
+# 完全不碰 ACME，也就不消耗 Let's Encrypt 的签发配额（每周 5 张，用完锁一周）。
+#
+# 这里**不开 access log**（Caddy 默认也不开），是有意的：/u/<32 位随机> 那条路径
+# 就是 unlisted 条目的全部防护，把它写进日志等于给这个秘密多开一个存放点，
+# 而 docker logs 会被随手 grep、被随手贴进 issue。要排错就临时开，别常开。
+{$CAIRN_DOMAIN} {
 	encode zstd gzip
 
 	# 静态产物：public + unlisted。这条是默认路径，绝大多数请求走这里。
+	# 这个路径在容器里，来自一个只读 bind mount（docker-compose.yml 的 volumes 段）：
+	# 宿主机 /srv/cairn/web → 容器 /srv/cairn/web，两边同一个路径，日志和文档不用换算。
+	# 挂的是 web/ 而不是 web/dist，理由写在 compose 里那一段——和 scripts/publish
+	# 的原子替换有关，改之前先读。
 	root * /srv/cairn/web/dist
 	file_server
 
 	# 只有静态壳做不到的事才转给 Go 服务。见 ARCHITECTURE.md 第 1 节。
+	#
+	# 上游是 compose 网络里的服务名（docker-compose.yml 里的 `server:`），不是 127.0.0.1——
+	# Caddy 自己也在容器里，它的回环就是它自己，写 127.0.0.1:8787 是反代到自己身上，
+	# 而症状是 502，和「Go 服务没起来」一模一样。
+	# 服务名的解析发生在**每次请求时**（Docker 内建 DNS），不是启动时：所以 Go 服务
+	# 还没起来、或者正在崩溃循环时，Caddy 照常启动、静态页照常发，只有这两条路由回 502。
+	# 这正是要的形态——写入通道挂了不该把整个站一起拖下水（compose 里的 depends_on
+	# 因此只用 service_started，不用 service_healthy）。
 	#
 	# 这一段同时覆盖两条鉴权方式完全不同的路由，所以这里**不能**加任何统一的门禁：
 	#
@@ -22,10 +55,10 @@ example.com {
 	# Telegram 只往 443 / 80 / 88 / 8443 推，且证书必须是公开可信的——Caddy 自动签发的
 	# 就是。所以 webhook 不需要在这里多写一行，它本来就在 /api/* 里。
 	handle /api/* {
-		reverse_proxy 127.0.0.1:8787
+		reverse_proxy server:8787
 	}
 	handle /circle/* {
-		reverse_proxy 127.0.0.1:8787
+		reverse_proxy server:8787
 	}
 
 	# feed.xml 是构建产出的静态文件，由 Caddy 按自己的 mime 表发（.xml → text/xml）。

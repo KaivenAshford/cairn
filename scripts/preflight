@@ -1,0 +1,940 @@
+#!/usr/bin/env bash
+# 部署前自检。把 deploy/README.md 的「容易踩的几脚」变成跑得起来的断言。
+#
+#   scripts/preflight                     # 全部检查
+#   scripts/preflight --offline           # 不碰网络：DNS 与公网 IP 那两条跳过
+#   scripts/preflight --only env,content  # 只跑某几节（tools ports env content domain build）
+#   scripts/preflight --root /srv/cairn   # 检查别处的一份仓库（默认是本脚本所在的那份）
+#
+# 为什么要有它：那几脚现在只是 README 里的文字，靠人读到、记住、并且在正确的时刻想起来。
+# 而这个仓库的规矩是「安全性质要有跑得起来的断言，不能靠记得」——部署前置条件是同一类
+# 东西，甚至更阴：漏了不会当场报错，它在半小时后变成一个**症状和原因对不上**的故障。
+# CAIRN_UID 填错的症状是「每条写入都 500」，真正的原因（permission denied）只在容器日志里；
+# 80 端口还被 nginx 占着的症状是「证书签不下来」。所以每条检查失败时都要说清楚
+# **怎么修**，而不只是「检查失败」。
+#
+# 这个脚本**只读**：不装东西、不改配置、不起容器、不写任何文件（唯一的例外是内容目录里
+# 一个立刻删掉的探针文件，用来验证「真的写得进去」）。可以随便跑，跑几遍都行。
+# scripts/deploy 在动手之前调它一次，它也能单独跑。
+#
+# 尽量**从配置文件里读事实**，不写死。端口去 compose 的 ports 段读、内容目录去 volumes 段
+# 读、域名去 Caddyfile 的站点地址读——因为这几个文件还会改（Caddy 刚从宿主机搬进
+# compose），而一份「查的是旧事实」的自检比没有自检更坏：它会绿着灯放行。
+#
+# 致命与警告分开，因为它们该导致的动作不同：
+#   ✗ 致命 —— 现在部署一定失败（80 被占、没有 docker、uid 对不上）。
+#   ! 警告 —— 现在部署能成，只是有条件还没满足、或者这台机器查不了
+#            （DNS 还没生效可以先部署后解析；拿不到公网 IP 时也降级成警告，
+#             把「查不了」说成「不对」会让人去改一条本来是对的 DNS 记录）。
+#
+# 退出码 = 致命项条数（封顶 63：再多没有意义，而 126 / 127 / 128+n 是 shell 自己的地盘）。
+# 用法错误退 64，和「64 条致命」撞不上。
+set -uo pipefail
+
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$SELF_DIR/.." && pwd)
+OFFLINE=0
+ALL_SECTIONS="tools ports env content domain build"
+SECTIONS=$ALL_SECTIONS
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --offline)  OFFLINE=1; shift ;;
+    --only)     ONLY=${2:-}; shift 2 ;;
+    --only=*)   ONLY=${1#--only=}; shift ;;
+    --root)     ROOT=${2:-}; shift 2 ;;
+    --root=*)   ROOT=${1#--root=}; shift ;;
+    -h|--help)  sed -n '2,10p' "$0" | sed 's/^#\{1,\} \{0,1\}//'; exit 0 ;;
+    *)          echo >&2 "不认识的参数：$1（--help 看用法）"; exit 64 ;;
+  esac
+done
+
+# --only 的名字写错必须停下来。默默跑零条检查然后报「全部通过」比不跑更坏：
+# 调它的 scripts/deploy 会把那个 0 当成「查过了，没问题」。
+if [ -n "${ONLY:-}" ]; then
+  picked=""
+  for s in ${ONLY//,/ }; do
+    case " $ALL_SECTIONS " in
+      *" $s "*) picked="$picked $s" ;;
+      *) echo >&2 "没有这一节：$s（可选：$ALL_SECTIONS）"; exit 64 ;;
+    esac
+  done
+  SECTIONS=$picked
+fi
+
+[ -d "$ROOT" ] || { echo >&2 "--root 指的不是一个目录：$ROOT"; exit 64; }
+ROOT=$(cd "$ROOT" && pwd)
+
+ENVFILE="$ROOT/.env"
+COMPOSE="$ROOT/deploy/docker-compose.yml"
+CADDYFILE="$ROOT/deploy/Caddyfile"
+ASTROCFG="$ROOT/web/astro.config.mjs"
+
+fatals=0
+warns=0
+DOCKER_OK=0        # docker CLI + compose 插件 + 守护进程，三样齐了才置 1
+STACK_UP=0         # 本站自己的 compose 栈已经在跑（端口占用的判定要用它）
+
+# 这个脚本唯一会创建的文件：内容目录里的写权限探针（见 sec_content）。
+# 收尾写成 trap 而不是「成功分支里 rm 一下」，因为**会留下文件的恰恰是没走到那一行的
+# 那一次**——Ctrl-C、`timeout`（发的是 SIGTERM）、CI 超时被杀。
+# 留下的后果不是「多一个文件」：内容目录是一个 git 仓库，一个未跟踪的文件就让
+# `git status --porcelain` 非空，而 scripts/deploy 看到它非空就**跳过 git pull**，
+# 并说「那多半是刚落盘还没 commit 的条目」。于是内容仓从此静默地不再更新，
+# 而症状指向的是一件没发生过的事——又一脚「症状和原因对不上」，还是自检自己踩的。
+PROBE=""
+drop_probe() { [ -n "$PROBE" ] && rm -f "$PROBE"; PROBE=""; return 0; }
+trap drop_probe EXIT
+
+# 颜色只在终端里上。管道里（CI、测试、tee 进文件）要的是能 grep 的纯文本，
+# 而 \033[32m 会插在标记和文字之间，让「grep 一下有没有这条」变成一件要转义的事。
+if [ -t 1 ]; then C_OK=$'\033[32m'; C_BAD=$'\033[31m'; C_WARN=$'\033[33m'; C_OFF=$'\033[0m'
+else C_OK=""; C_BAD=""; C_WARN=""; C_OFF=""; fi
+
+# 第一个参数是结论，后面每个参数是一行「怎么修」。两级缩进：结论要能一眼扫过去，
+# 修法是停下来之后才读的。
+ok()   { printf '  %s✓%s %s\n' "$C_OK" "$C_OFF" "$1"; }
+bad()  { printf '  %s✗%s %s\n' "$C_BAD" "$C_OFF" "$1"; shift; for l in "$@"; do printf '      %s\n' "$l"; done; fatals=$((fatals + 1)); }
+warn() { printf '  %s!%s %s\n' "$C_WARN" "$C_OFF" "$1"; shift; for l in "$@"; do printf '      %s\n' "$l"; done; warns=$((warns + 1)); }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# 外部命令一律限时。自检卡住比自检失败更糟：人会以为它在认真检查，
+# 其实是 docker 守护进程没起来、或者 DNS 查询在等三十秒超时。
+run() { # run <秒> <命令...>
+  local t=$1; shift
+  if have timeout; then timeout "$t" "$@"; else "$@"; fi
+}
+
+# 把多行报错压成一行，好塞进「原文：……」里。整段贴出来会把结论淹掉。
+# 截断用 bash 自己的切片而不是 `cut -c`：GNU 的 -c 数的是**字节**，
+# 一刀切在一个中文字符中间，输出里就多一个乱码方块——而这一行往往正是要贴给别人看的那一行。
+one_line() { local t; t=$(printf '%s' "$1" | tr '\n' ' ' | tr -s ' '); printf '%s' "${t:0:200}"; }
+
+# 读 .env 里的一个键。
+#
+# 为什么不 `source`：这份文件是给 docker compose 的 env_file 用的，不是 shell 脚本。
+# 里面一行 `CAIRN_TOKEN=$(rm -rf ~)` 对 compose 只是一个字面量，对 source 是执行。
+# 一个「部署前自检」读的恰恰是还没被人看过的那份配置，不能顺手给它执行权。
+# 另外 source 会把这些值灌进本进程的环境，之后任何一处不小心 echo 就是把 token 打上屏幕。
+envget() {
+  [ -f "$ENVFILE" ] || return 1
+  awk -v k="$1" '
+    { line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (line ~ /^#/ || line == "") next
+      sub(/^export[[:space:]]+/, "", line)
+      i = index(line, "=")
+      if (i == 0) next
+      key = substr(line, 1, i - 1); val = substr(line, i + 1)
+      sub(/[[:space:]]+$/, "", key)
+      if (key != k) next
+      # 成对的引号剥掉，和 compose 的 dotenv 一致。
+      if (val ~ /^".*"$/ || val ~ /^'"'"'.*'"'"'$/) val = substr(val, 2, length(val) - 2)
+      out = val; found = 1        # 同名后来者覆盖先来者，所以一路记到最后一条
+    }
+    END { if (found) print out }
+  ' "$ENVFILE"
+}
+
+# 字节数，不是字符数。服务端那两处长度校验是 Go 的 len()，量的是字节；
+# 用 ${#var} 的话一个中文字符在 UTF-8 locale 下算 1、在 Go 那边算 3——
+# 于是自检说「够长」而服务端拒绝启动。
+bytelen() { printf '%s' "$1" | wc -c | tr -d ' '; }
+
+# 从 URL 里取主机名（去掉协议、端口、路径、用户名）。
+url_host() { printf '%s' "$1" | sed -e 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' -e 's#[/?#].*$##' -e 's#^[^@]*@##' -e 's#:[0-9]*$##'; }
+
+# 属主与权限。GNU 是 stat -c，BSD / macOS 是 stat -f，两边都试。
+owner_uid() { stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null; }
+owner_gid() { stat -c %g "$1" 2>/dev/null || stat -f %g "$1" 2>/dev/null; }
+mode_of()   { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null; }
+
+# 某个端口上的监听者，一行一个「地址 进程」。
+# 三条实现按可靠度排：ss（带进程名，要 root 才看得到）→ netstat → bash 的 /dev/tcp。
+# 最后那条只能从回环发起连接，只绑公网地址的监听者它看不见——所以它只是兜底：
+# 命中了就报，没命中**不等于**没人占（can_prove_free 就是为了说清这件事）。
+listeners() { # listeners <端口> [tcp|udp]
+  local p=$1 proto=${2:-tcp}
+  if have ss; then
+    if [ "$proto" = udp ]; then ss -lnupH 2>/dev/null; else ss -lntpH 2>/dev/null; fi |
+      awk -v p=":$p\$" '$4 ~ p { proc = ""; for (i = 5; i <= NF; i++) proc = proc " " $i; print $4 proc }'
+  elif have netstat; then
+    netstat -ln${proto:0:1}p 2>/dev/null | awk -v p=":$p\$" '$4 ~ p { print $4 " " $7 }'
+  elif [ "$proto" = tcp ]; then
+    (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null && echo "127.0.0.1:$p ?（只能从回环探到，看不出是谁）"
+  fi
+}
+can_prove_free() { have ss || have netstat; }
+
+# compose 的 ports 段，一行一条原始条目（"80:80"、"127.0.0.1:8787:8787"、"443:443/udp"）。
+# 为什么从文件里读而不是写死 80/443：Caddy 刚从宿主机搬进 compose，这一段还会变
+#（8787 的宿主机映射就是这次删掉的）。写死的话，删掉的端口会被一直查，
+# 新加的端口一条都查不到——而后者正是「部署失败」那一侧。
+compose_ports() {
+  [ -f "$COMPOSE" ] || return 0
+  awk '
+    /^[[:space:]]*ports:[[:space:]]*$/ { inp = 1; next }
+    inp && /^[[:space:]]*-[[:space:]]/ {
+      line = $0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+      sub(/[[:space:]]*#.*$/, "", line)
+      gsub(/"/, "", line); gsub(/'"'"'/, "", line)
+      if (line ~ /^[0-9.]+:[0-9]+/ || line ~ /^[0-9]+(\/|$)/) print line
+      next
+    }
+    inp && /^[[:space:]]*[a-z_]+:/ { inp = 0 }
+  ' "$COMPOSE"
+}
+
+# compose 里所有 `${VAR:?...}` 形式的变量：缺了就拒绝启动的那些。
+# 一样是从文件里读，compose 那边加一个新的必填变量，这里自动跟上。
+compose_required_vars() {
+  [ -f "$COMPOSE" ] || return 0
+  grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*:\?' "$COMPOSE" 2>/dev/null | sed 's/^\${//; s/:?$//' | sort -u
+}
+
+# compose 里所有被**插值**的变量（${VAR}、${VAR:-默认}、${VAR:?说明} 都算）。
+# 和上面那个的区别：那个是「缺了就拒绝启动」的子集，这个是「值从哪来」的全集。
+# 要区分是因为插值的取值顺序和 env_file 不一样，见 sec_env 里那条 shell 覆盖的检查。
+compose_interpolated_vars() {
+  [ -f "$COMPOSE" ] || return 0
+  grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*' "$COMPOSE" 2>/dev/null | sed 's/^\${//' | sort -u
+}
+
+# compose 里的挂载，一行一条「类型<TAB>宿主机路径<TAB>容器路径」。
+#
+# 短写法（`- 源:目标:ro`）和长写法（`- type: bind` / `source:` / `target:`）都要认。
+# 不是为了周全好看：这个文件正在改（Caddy 刚搬进来，volumes 这两天就从短写法换成了
+# 长写法，为的是关掉 create_host_path），而一份只认旧写法的自检会**静默地什么都不查**
+# ——它不会报错，只会少打印几行，然后说「全部通过」。这比没有自检更坏。
+# 相对路径按 compose 文件所在目录解析（compose 自己就是这么算的）。
+compose_mounts() {
+  [ -f "$COMPOSE" ] || return 0
+  local dir; dir=$(dirname "$COMPOSE")
+  awk '
+    function emit() {
+      # 空字段也要占位：tab 是 IFS 里的空白字符，`a\t\tb` 在 read 那边会被并成两段，
+      # 于是 tmpfs（没有 source）那一条的容器路径会跑到「宿主机路径」那一列上。
+      if (tgt != "") printf "%s\t%s\t%s\n", (typ != "" ? typ : "bind"), (src != "" ? src : "-"), tgt
+      typ = ""; src = ""; tgt = ""
+    }
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*-[[:space:]]/ {
+      emit()
+      line = $0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+      sub(/[[:space:]]*#.*$/, "", line)
+      gsub(/"/, "", line); gsub(/\047/, "", line)
+      if (line ~ /^type:/)   { typ = line; sub(/^type:[[:space:]]*/, "", typ); next }
+      if (line ~ /^source:/) { src = line; sub(/^source:[[:space:]]*/, "", src); next }
+      if (line ~ /^target:/) { tgt = line; sub(/^target:[[:space:]]*/, "", tgt); next }
+      n = split(line, a, ":")                       # 短写法：源:目标[:选项]
+      # 源以 . 或 / 开头才是 bind；否则是具名卷（`- caddy_data:/data`），
+      # 把它当路径去解析的话，会算出一个 deploy/caddy_data 这样根本不存在的宿主机目录。
+      if (n >= 2 && a[2] ~ /^\//) { typ = (a[1] ~ /^[.\/]/) ? "bind" : "volume"; src = a[1]; tgt = a[2]; emit() }
+      next
+    }
+    /^[[:space:]]*type:/   { v = $0; sub(/^[[:space:]]*type:[[:space:]]*/, "", v);   gsub(/"/, "", v); typ = v; next }
+    /^[[:space:]]*source:/ { v = $0; sub(/^[[:space:]]*source:[[:space:]]*/, "", v); gsub(/"/, "", v); src = v; next }
+    /^[[:space:]]*target:/ { v = $0; sub(/^[[:space:]]*target:[[:space:]]*/, "", v); gsub(/"/, "", v); tgt = v; next }
+    END { emit() }
+  ' "$COMPOSE" |
+  while IFS=$'\t' read -r typ src tgt; do
+    if [ "$typ" = bind ]; then
+      case "$src" in
+        -|/*) ;;
+        *) src=$(cd "$dir" 2>/dev/null && cd "$(dirname "$src")" 2>/dev/null && printf '%s/%s' "$(pwd)" "$(basename "$src")") ;;
+      esac
+    fi
+    printf '%s\t%s\t%s\n' "$typ" "$src" "${tgt%%/}"
+  done
+}
+
+# 只要 bind mount：宿主机上真有一个目录 / 文件被送进容器的那些。
+compose_binds() { compose_mounts | awk -F'\t' '$1 == "bind" && $2 != "-" { print $2 "\t" $3 }'; }
+
+# 所有挂载点的**容器内路径**。遮蔽检查（见 sec_content）要靠它，
+# 所以 tmpfs、具名卷也要算进来——盖住一个目录的可以是任何一种挂载。
+compose_targets() { compose_mounts | awk -F'\t' '{ print $3 }' | sort -u; }
+
+# ── 工具与守护进程 ──────────────────────────────────────────────────────────
+sec_tools() {
+  echo "工具与守护进程："
+
+  if ! have docker; then
+    bad "没有 docker" \
+        "装：curl -fsSL https://get.docker.com | sh" \
+        "装完把自己加进 docker 组：sudo usermod -aG docker \$USER，然后重新登录" \
+        "整个部署只依赖这一件事——服务器上除了 Docker 什么都不用装"
+  elif ! docker compose version >/dev/null 2>&1; then
+    if have docker-compose; then
+      bad "只有独立的 docker-compose（v1），没有 compose v2 插件" \
+          "deploy/docker-compose.yml 用的是 compose 规范的新写法（env_file 的 path / required），v1 解析不了" \
+          "装：sudo apt install docker-compose-plugin（或按 https://get.docker.com 重装一遍 docker）"
+    else
+      bad "有 docker，但没有 docker compose 插件" \
+          "装：sudo apt install docker-compose-plugin"
+    fi
+  else
+    local info
+    if info=$(run 20 docker info --format '{{.ServerVersion}}' 2>&1); then
+      ok "docker $(docker --version 2>/dev/null | sed 's/^Docker version //; s/,.*//') + compose $(docker compose version --short 2>/dev/null)，守护进程 $info"
+      DOCKER_OK=1
+    elif printf '%s' "$info" | grep -qi 'permission denied'; then
+      bad "连不上 docker 守护进程：当前用户读不了 /var/run/docker.sock" \
+          "sudo usermod -aG docker \$USER，然后**重新登录**" \
+          "（newgrp docker 只对当前这个 shell 生效，下一个终端里又会失败——最像玄学的那类故障）"
+    else
+      bad "连不上 docker 守护进程" \
+          "sudo systemctl enable --now docker" \
+          "docker 说：$(one_line "$info")"
+    fi
+  fi
+
+  # ── 下面几条读的是 YAML，不依赖守护进程，所以 docker 不在也要查。
+  if [ ! -f "$COMPOSE" ]; then
+    bad "没有 $COMPOSE" "这份仓库不完整？重新 clone 一次"
+    return
+  fi
+
+  # deploy/README.md：「别在 compose 里删掉 CAIRN_ADDR: 0.0.0.0:8787」。
+  # 删掉之后 .env 里那个 127.0.0.1:8787 会生效，Go 服务在容器里绑回环，
+  # Caddy（另一个容器）一条也连不进来——而症状极具迷惑性：容器 running、
+  # healthcheck 绿的（探活也在容器内），只有 /api/* 全线 502。
+  if grep -Eq '^[[:space:]]*CAIRN_ADDR:[[:space:]]*0\.0\.0\.0:' "$COMPOSE"; then
+    ok "compose 里 CAIRN_ADDR 绑的是 0.0.0.0（绑回环 = 别的容器连不进来，而且看着一切正常）"
+  else
+    bad "compose 的 server.environment 里没有 CAIRN_ADDR: 0.0.0.0:8787" \
+        ".env 里那个 127.0.0.1:8787 会生效，于是 Caddy 连不上 Go 服务，/api/* 全线 502" \
+        "而容器 running、healthcheck 还是绿的（探活也在容器内）——没有任何地方会指向这一行" \
+        "补回 deploy/docker-compose.yml 里 server.environment 下的那一行"
+  fi
+
+  # compose 里凡是写成 ${VAR:?...} 的都是「缺了就拒绝启动」。这是这个仓库的取向
+  #（宁可停下来问，不要猜一个默认值往下走），但拒绝启动是在 up 的那一刻才发生的，
+  # 而那时候人已经在等部署完成了。在这里先问一遍。
+  local missing="" v
+  for v in $(compose_required_vars); do
+    [ -n "$(envget "$v")" ] || missing="$missing $v"
+  done
+  if [ -n "$missing" ]; then
+    bad "compose 要求这些变量必须有值，而 .env 里没有：${missing# }" \
+        "compose 里它们写成 \${VAR:?...}，缺了会直接拒绝启动（这是有意的：与其猜一个默认值，不如停下来问）" \
+        "填进 $ENVFILE"
+  elif [ -n "$(compose_required_vars)" ]; then
+    ok "compose 的必填变量都在 .env 里：$(compose_required_vars | tr '\n' ' ')"
+  fi
+}
+
+# 依赖守护进程的那几条 compose 检查。和上面分开是因为它们跑得慢（要连 docker），
+# 而且 docker 不在时整段都得跳过。
+sec_tools_docker() {
+  [ "$DOCKER_OK" -eq 1 ] || return 0
+  [ -f "$COMPOSE" ] || return 0
+
+  # 必须带 --env-file：compose 的变量替换读的是**项目目录**下的 .env，而项目目录默认是
+  # compose 文件所在的 deploy/，不是仓库根。不指路的话这里会因为 ${CAIRN_DOMAIN:?} 报错，
+  # 而那个报错和「.env 里明明填了」对不上。自检要按 scripts/deploy 真正的调法来验。
+  local cfg
+  if ! cfg=$(run 60 docker compose --env-file "$ENVFILE" -f "$COMPOSE" config 2>&1); then
+    bad "docker compose 解析不了 deploy/docker-compose.yml" \
+        "compose 说：$(one_line "$cfg")" \
+        "常见原因：.env 不在（env_file 写着 required: true），或者某个 \${VAR:?} 还空着"
+    return
+  fi
+  ok "docker compose config 能解析（带 --env-file $ENVFILE）"
+
+  # 容器实际会用哪个 uid，问 compose 自己，不猜。
+  # 为什么不能只看 .env：compose 里 `user: "${CAIRN_UID}"` 这类插值取的是**项目目录**
+  # 下的 .env，而 env_file 灌进容器环境的是另一码事，两者不是同一个来源。
+  # 对不上时容器会以另一个 uid 跑起来，然后每条写入 500，而 .env 里明明写着对的 uid。
+  local want_uid want_gid resolved
+  want_uid=$(envget CAIRN_UID); want_gid=$(envget CAIRN_GID)
+  resolved=$(printf '%s' "$cfg" | sed -n 's/^[[:space:]]*user:[[:space:]]*"\{0,1\}\([0-9]\+:\{0,1\}[0-9]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -1)
+  if [ -n "$resolved" ] && [ -n "$want_uid" ]; then
+    if [ "$resolved" = "$want_uid:$want_gid" ] || [ "$resolved" = "$want_uid" ]; then
+      ok "compose 解析出来的 user 是 $resolved，和 .env 的 CAIRN_UID/CAIRN_GID 对得上"
+    else
+      bad "compose 解析出来的 user 是 $resolved，而 .env 里写的是 $want_uid:$want_gid" \
+          "容器会以 $resolved 跑，写不进内容目录 → 每条写入都返回 500，而响应里只有一句 internal error" \
+          "起容器时带上 --env-file：docker compose --env-file .env -f deploy/docker-compose.yml up -d"
+    fi
+  fi
+
+  # 本站自己的容器在不在跑。下面「端口被占」要用它区分「别人占着」（致命）
+  # 和「上一次部署留下的自己」（重新 up 一次就好）。
+  local running
+  running=$(run 30 docker compose --env-file "$ENVFILE" -f "$COMPOSE" ps --status running --format '{{.Service}}' 2>/dev/null)
+  if [ -n "$running" ]; then
+    STACK_UP=1
+    ok "本站的 compose 栈已经在跑：$(one_line "$running")（重新部署会重启它们）"
+  fi
+}
+
+# ── 端口 ────────────────────────────────────────────────────────────────────
+sec_ports() {
+  echo "端口："
+  if ! can_prove_free; then
+    warn "本机没有 ss 也没有 netstat，查不了端口占用" \
+         "装一个：sudo apt install iproute2" \
+         "查不了不等于空着。80 被别的东西占着的话，Caddy 起不来、证书也签不下来"
+  fi
+
+  local entries; entries=$(compose_ports)
+  if [ -z "$entries" ]; then
+    warn "compose 里读不出 ports 段，端口这一节没得查" "确认 deploy/docker-compose.yml 里 caddy 服务映射了 80 和 443"
+    return
+  fi
+
+  local e spec proto hostport bind who
+  for e in $entries; do
+    proto=tcp
+    case "$e" in *"/"*) proto=${e##*/}; spec=${e%%/*} ;; *) spec=$e ;; esac
+    # 三段是 bind:host:container，两段是 host:container，一段就是端口本身。
+    case "$(printf '%s' "$spec" | tr -cd ':' | wc -c | tr -d ' ')" in
+      2) bind=${spec%%:*}; hostport=$(printf '%s' "$spec" | cut -d: -f2) ;;
+      1) bind=""; hostport=${spec%%:*} ;;
+      *) bind=""; hostport=$spec ;;
+    esac
+    [ -n "$hostport" ] || continue
+    [ "$proto" = udp ] && ! have ss && continue   # netstat 那条兜底只查 tcp，udp 就别假装查过
+
+    who=$(listeners "$hostport" "$proto")
+    if [ -z "$who" ]; then
+      ok "$hostport/$proto 空着${bind:+（只映射到 $bind）}"
+    elif [ "$STACK_UP" -eq 1 ] && printf '%s' "$who" | grep -qEi 'docker|caddy'; then
+      warn "$hostport/$proto 被本站自己的容器占着：$(one_line "$who")" \
+           "重新部署时 compose 会先停掉它，正常"
+    elif [ "$hostport" = 80 ] || [ "$hostport" = 443 ]; then
+      bad "$hostport/$proto 被占着：$(one_line "$who")" \
+          "Caddy 起不来，证书也签不下来（ACME 的挑战要走 80 / 443）" \
+          "最常见的是服务器上还留着一个 nginx 或 apache：sudo systemctl disable --now nginx" \
+          "看清楚是谁：sudo ss -lntp | grep :$hostport"
+    else
+      bad "$hostport/$proto 被占着：$(one_line "$who")" \
+          "compose 起容器时会报 bind: address already in use，但不会说是谁占的" \
+          "看清楚是谁：sudo ss -lntp | grep :$hostport"
+    fi
+  done
+}
+
+# ── .env ────────────────────────────────────────────────────────────────────
+sec_env() {
+  echo ".env："
+  if [ ! -f "$ENVFILE" ]; then
+    bad "没有 $ENVFILE" \
+        "cp .env.example .env，然后至少填 CAIRN_TOKEN（openssl rand -hex 32）和 CAIRN_UID / CAIRN_GID" \
+        "compose 里 env_file 写着 required: true，缺了它连容器都起不来"
+    return
+  fi
+  ok ".env 在"
+
+  # .env 里有 token 和 secret。它不该进 git，也不该让同机器上的别人读到。
+  if (cd "$ROOT" && git ls-files --error-unmatch .env >/dev/null 2>&1); then
+    bad ".env 被 git 追踪了" \
+        "里面是 CAIRN_TOKEN 和 Telegram 的 secret，提交进去就是把它们发出去了" \
+        "git rm --cached .env；已经推上去的话，token 要换掉——改历史来不及"
+  else
+    ok ".env 不进 git"
+  fi
+  local m; m=$(mode_of "$ENVFILE")
+  if [ -n "$m" ] && [ "$((8#$m & 8#0044))" -ne 0 ]; then
+    warn ".env 的权限是 $m，同机器上别的用户能读它" "chmod 600 .env"
+  fi
+
+  local token tlen
+  token=$(envget CAIRN_TOKEN); tlen=$(bytelen "$token")
+  if [ -z "$token" ]; then
+    bad "CAIRN_TOKEN 是空的 → 容器会无限重启" \
+        "服务拒绝在没有 token 的情况下启动（一个能往磁盘写文件的接口不能因为忘配环境变量就裸奔）" \
+        "配上 restart: unless-stopped 之后，那就是一个崩溃循环，healthcheck 一直红" \
+        "生成一个：openssl rand -hex 32"
+  elif [ "$tlen" -lt 32 ]; then
+    bad "CAIRN_TOKEN 只有 $tlen 字节，服务端要求至少 32 → 容器会无限重启" "openssl rand -hex 32"
+  else
+    ok "CAIRN_TOKEN 有 $tlen 字节（≥ 32）"
+  fi
+
+  # 值末尾的空白。它在编辑器里看不见，却会跟着一起被送进容器：token 对不上，
+  # 而两边打印出来的字符串看起来一模一样。
+  if grep -qE '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=.*[[:space:]]+$' "$ENVFILE"; then
+    warn ".env 里有值以空白字符结尾" \
+         "不同版本的 compose 对末尾空白的处理不一致，而它在编辑器里看不见——删掉最省事" \
+         "找出来：grep -nE '=.*[[:space:]]+\$' .env"
+  fi
+
+  # Telegram：要么两个都配，要么两个都不配。半配是唯一危险的状态，服务端会拒绝启动。
+  local sec allow
+  sec=$(envget CAIRN_TELEGRAM_SECRET); allow=$(envget CAIRN_TELEGRAM_ALLOW)
+  if [ -z "$sec" ] && [ -z "$allow" ]; then
+    ok "Telegram 两个变量都没配 = 不开这条通道（路由根本不注册，/api/telegram 返回 404）"
+  elif [ -z "$sec" ] || [ -z "$allow" ]; then
+    bad "Telegram 只配了一个（SECRET $([ -n "$sec" ] && echo 有 || echo 无) / ALLOW $([ -n "$allow" ] && echo 有 || echo 无)） → 容器会无限重启" \
+        "半配是唯一危险的状态：填了名单忘了 secret，等于把一个能往磁盘写文件的端点挂在公网上，靠「没人知道这个路径」活着" \
+        "两个都填，或者两个都清空"
+  else
+    local slen; slen=$(bytelen "$sec")
+    if [ "$slen" -lt 32 ]; then
+      bad "CAIRN_TELEGRAM_SECRET 只有 $slen 字节，服务端要求至少 32 → 容器会无限重启" "openssl rand -hex 32"
+    elif printf '%s' "$sec" | grep -q '[^A-Za-z0-9_-]'; then
+      bad "CAIRN_TELEGRAM_SECRET 里有 Telegram 不接受的字符 → 容器会无限重启" \
+          "只能用 A-Z a-z 0-9 _ -（openssl rand -hex 32 的产物一定合法）" \
+          "服务端在启动时就拦，是为了不用等到调 setWebhook 那一刻才发现"
+    else
+      ok "CAIRN_TELEGRAM_SECRET 有 $slen 字节，且只有 A-Za-z0-9_-"
+    fi
+    local one badid=""
+    for one in ${allow//,/ }; do
+      case "$one" in
+        ''|*[!0-9]*) badid="$badid $one" ;;
+        0) badid="$badid $one" ;;
+      esac
+    done
+    if [ -n "$badid" ]; then
+      bad "CAIRN_TELEGRAM_ALLOW 里有不是数字 id 的东西：${badid# } → 容器会无限重启" \
+          "这里只能填数字用户 id，不是 @用户名（用户名能被改掉、放弃之后还能被别人注册走）" \
+          "怎么拿到自己的 id：起服务、给 bot 发一条消息，日志里会有「拒绝来自 <id> 的消息」"
+    else
+      ok "CAIRN_TELEGRAM_ALLOW 是 $(printf '%s' "${allow//,/ }" | wc -w | tr -d ' ') 个数字 id"
+    fi
+  fi
+
+  # 当前 shell 里 export 着的同名变量会**盖掉** .env。
+  #
+  # 这一条是实测出来的，不是照文档写的：compose 的**变量插值**（compose 文件里
+  # 那些 ${VAR}）取值顺序是「shell 环境 > --env-file」，而 env_file 灌进容器的那份
+  # 是另一条路。两条路撞在一起的地方就是 compose 里的 environment: 段——它优先于
+  # env_file，于是 `TZ: ${TZ:-Asia/Shanghai}` 在一个 export 了 TZ 的 shell 里，
+  # 拿的是 shell 那个值，.env 里写的那行**完全不起作用**。
+  # 实测（compose v2.39.1）：.env 写 TZ=Asia/Tokyo、shell 里 TZ=America/Los_Angeles，
+  # `docker compose config` 解析出来的是 America/Los_Angeles。
+  # 症状：条目的 created 和 id 里的日期前缀按另一个时区算，晚上写的东西标成前一天；
+  # 换成 CAIRN_DOMAIN 就是 Caddy 去给另一个域名签证书。而 .env 里明明写着对的值。
+  local shadowed="" iv
+  for iv in $(compose_interpolated_vars); do
+    [ -n "${!iv+x}" ] || continue                 # shell 里根本没有这个变量
+    [ "${!iv}" = "$(envget "$iv")" ] && continue  # 一样，无所谓
+    shadowed="$shadowed $iv"
+  done
+  if [ -n "$shadowed" ]; then
+    warn "这个 shell 里 export 着${shadowed}，它们会盖掉 .env 里的同名值" \
+         "compose 的变量插值取的是「shell 环境 > --env-file」，而 compose 里的 environment: 段又优先于 env_file" \
+         "于是 .env 里那一行完全不起作用，而它看着好好的（TZ 错 → 条目日期差一天；CAIRN_DOMAIN 错 → 给另一个域名签证书）" \
+         "起容器之前先 unset：$(printf 'unset%s' "$shadowed")"
+  elif [ -n "$(compose_interpolated_vars)" ]; then
+    ok "shell 里没有 export 会盖掉 .env 的同名变量"
+  fi
+
+  # uid / gid 得是数字。compose 里它们是 ${CAIRN_UID:?}，缺了会拒绝启动（上一节已经查过），
+  # 这里查的是「填了，但填的是用户名」。
+  local u g
+  u=$(envget CAIRN_UID); g=$(envget CAIRN_GID)
+  if [ -n "$u$g" ] && printf '%s' "$u$g" | grep -q '[^0-9]'; then
+    bad "CAIRN_UID / CAIRN_GID 不是纯数字：'$u' / '$g'" \
+        "填 id -u 和 id -g 的输出（数字），不是用户名。当前这台机器上是 $(id -u) / $(id -g)"
+  elif [ -n "$u" ] && [ -n "$g" ]; then
+    ok "CAIRN_UID / CAIRN_GID = $u / $g"
+  fi
+}
+
+# ── 内容目录 ────────────────────────────────────────────────────────────────
+# 那个 500 的根因就在这一节。
+sec_content() {
+  echo "内容目录："
+  # 容器实际挂的是哪个宿主机目录，去 compose 里读，不写死：compose 里那一行改了的话，
+  # 这里查的就成了另一个目录——「查过的」和「挂上去的」不是同一个，等于没查。
+  local dir line
+  line=$(compose_binds | awk -F'\t' '$2 == "/content/entries" { print $1; exit }')
+  dir=${line:-$ROOT/web/content/entries}
+
+  if [ ! -d "$dir" ]; then
+    bad "内容目录不在：$dir" \
+        "它是**单独的一个 private 仓库**，clone 主仓不会带上它：git clone <内容仓> '$dir'" \
+        "不先建好就起容器的话，dockerd 会以 root 身份把它建出来，于是 compose 里那个 user 依然写不进去" \
+        "而且条目会落进一个不受 git 管理的目录——「服务器炸了不丢」的前提就没了，还不会有任何报错提示你"
+    return
+  fi
+  ok "内容目录在：$dir"
+
+  local du dg wu wg
+  du=$(owner_uid "$dir"); dg=$(owner_gid "$dir")
+  wu=$(envget CAIRN_UID); wg=$(envget CAIRN_GID)
+  if [ -z "$wu" ]; then
+    warn "还不知道容器会用哪个 uid（.env 里没有 CAIRN_UID），没法比对属主" \
+         "这个目录现在属于 uid $du；把它填进 .env：CAIRN_UID=$du"
+  elif [ "$du" = "$wu" ]; then
+    ok "属主 uid = $du，和容器要用的一致"
+  else
+    bad "内容目录属于 uid $du，而容器会以 uid $wu 跑 → 写入通道对每一条都返回 500" \
+        "响应里只有一句 internal error，真正的原因（permission denied）只在容器日志里" \
+        "两条修法挑一条：sudo chown -R $wu:${wg:-$wu} '$dir'，或者把 .env 的 CAIRN_UID 改成 $du" \
+        "（当前登录用户是 $(id -u):$(id -g)）"
+  fi
+  [ -n "$wg" ] && [ "$dg" != "$wg" ] && warn "属主 gid 是 $dg，而 .env 里是 $wg（uid 对上就写得进去，这条只是不整齐）"
+
+  if [ -e "$dir/.git" ]; then
+    ok "内容目录是一个 git 仓库（服务器炸了不丢）"
+  else
+    warn "内容目录不受 git 管理" \
+         "它本该是 clone 下来的那个 private 内容仓；现在写进去的条目只存在于这台机器上" \
+         "见 web/content/README.md"
+  fi
+
+  # 能不能真的写进去。上面比的是 uid，这一条比的是结果：目录可能是只读挂载、
+  # 可能有 ACL、可能整个文件系统被 remount 成了 ro，这些 uid 都看不出来。
+  # 只在「当前用户就是那个属主」时做——不是的话，写成功也证明不了容器写得进去。
+  if [ "$(id -u)" = "$du" ]; then
+    # 先扫掉上一次被打断时留下的探针（名字带 pid，所以会一次次攒着）。
+    # 这一行不是「顺手打扫」：留着的那个会让 scripts/deploy 永远跳过内容仓的 pull，
+    # 理由见文件顶上 PROBE 那段。
+    local stale; stale=$(ls -1 "$dir"/.preflight-probe-* 2>/dev/null | wc -l | tr -d ' ')
+    [ "${stale:-0}" -gt 0 ] && rm -f "$dir"/.preflight-probe-* 2>/dev/null &&
+      warn "清掉了 $stale 个上次没删干净的写权限探针（.preflight-probe-*）" \
+           "它是这个脚本自己留下的：上一次跑到一半被 Ctrl-C 或 timeout 杀掉了" \
+           "留着的后果：内容仓 git status 非空 → scripts/deploy 从此静默跳过 git pull"
+    PROBE="$dir/.preflight-probe-$$"
+    if (umask 077; : > "$PROBE") 2>/dev/null; then
+      drop_probe; ok "属主本人确实写得进去（不是只读挂载、磁盘也没满）"
+    else
+      PROBE=""
+      bad "属主本人也写不进 $dir" "多半是只读挂载或者磁盘满了：mount | grep \" \$(df -P '$dir' | tail -1 | awk '{print \$6}') \""
+    fi
+  fi
+
+  # ── 遮蔽：内容目录不能整个进到别的容器里去。
+  # Caddy 那个容器挂的是 web/ 这一层（不是 web/dist，理由在 compose 里），
+  # 而 web/content/ 底下是四层可见度混在一起的真实条目。Caddyfile 的 root 指向 dist，
+  # 本来就发不出这些文件——但「发不出去」和「根本不在这个容器里」是两回事：
+  # 前者依赖 Caddyfile 一直是对的（一行 root 写错、一个 file_server 多开一处就破了），
+  # 后者不依赖任何配置。这正是 ARCHITECTURE 第 2 节那句「字节必须由服务端决定发不发」
+  # 在部署层的同一条推论，所以它是致命项。
+  local host_src ctr_dst rel proj shadowed
+  while IFS=$'\t' read -r host_src ctr_dst; do
+    [ -n "$host_src" ] || continue
+    case "$dir/" in
+      "$host_src"/*) ;;                 # 内容目录在这个 bind mount 底下
+      *) continue ;;
+    esac
+    [ "$host_src" = "$dir" ] && continue   # 挂的就是内容目录本身（server 那个），本来就该在
+    rel=${dir#"$host_src"/}
+    proj="$ctr_dst/$rel"                # 内容目录在那个容器里的位置
+    shadowed=""
+    for t in $(compose_targets); do
+      [ "$t" = "$ctr_dst" ] && continue          # 就是外层这个挂载，不算遮蔽
+      case "$proj/" in "$t"/*) shadowed=$t ;; esac
+    done
+    if [ -n "$shadowed" ]; then
+      ok "内容目录在 $host_src → $ctr_dst 这个挂载里，但被 $shadowed 盖住了（那个容器里看不到条目）"
+    else
+      bad "内容目录被整个挂进了另一个容器：$host_src → $ctr_dst，而 $proj 上没有任何遮蔽挂载" \
+          "那个容器里能读到四层可见度的全部条目，包括 private——它们不该在那台机器上的那个进程眼里存在" \
+          "在 compose 里给它盖一层空的 tmpfs：target: $(dirname "$proj")"
+    fi
+  done < <(compose_binds)
+}
+
+# ── 三处占位域名 + DNS ──────────────────────────────────────────────────────
+sec_domain() {
+  echo "域名："
+  # 占位域名最容易只改两处，而漏掉任何一处的后果都不是「链接不好看」：
+  #   astro 的 site  → 每一页的 canonical 指向别人的域名，等于把整站归给他们，
+  #                    而 /u/ 的未列出页还会把自己的随机路径写进那条 canonical
+  #   Caddy 的域名   → 证书给错域名签，站根本打不开
+  #   .env 的 URL    → Telegram 那句确认里的链接点不开
+  local site url caddy_site caddy_hosts host shost placeholder=0
+  # .env 不在的时候，CAIRN_URL 和 Caddy 的域名都读不出来——那是 .env 那一节的事，
+  # 在这里再报三行「读不出来」只会把真正的结论淹掉。说一句就够。
+  if [ ! -f "$ENVFILE" ]; then
+    warn "没有 .env，CAIRN_URL 和 Caddy 的域名都无从查起" "先 cp .env.example .env"
+  fi
+
+  site=$(sed -n "s/^const site = ['\"]\([^'\"]*\)['\"].*/\1/p" "$ASTROCFG" 2>/dev/null | head -1)
+  url=$(envget CAIRN_URL)
+  # Caddyfile 的站点地址：第一个「不是注释、以 { 结尾」的行。
+  caddy_site=$(awk '/^[[:space:]]*#/ { next } /\{[[:space:]]*$/ { sub(/\{[[:space:]]*$/, ""); gsub(/,/, " "); print; exit }' "$CADDYFILE" 2>/dev/null)
+  # 现在它写的是 {$CAIRN_DOMAIN}——值不在文件里，在 .env 里。顺着变量名去取，
+  # 不然这一节会对着一个占位符说「不是 example.com，通过」。
+  case "$caddy_site" in
+    *'{$'*)
+      local dvar; dvar=$(printf '%s' "$caddy_site" | sed -n 's/.*{\$\([A-Za-z_][A-Za-z0-9_]*\)}.*/\1/p')
+      caddy_hosts=$(envget "$dvar")
+      if [ -z "$caddy_hosts" ] && [ ! -f "$ENVFILE" ]; then
+        : # .env 都没有，上面已经说过一次了
+      elif [ -z "$caddy_hosts" ]; then
+        bad "Caddyfile 的域名来自 \$$dvar，而 .env 里它是空的" \
+            "填进 $ENVFILE：$dvar=你的域名（演练部署可以填 localhost，Caddy 会用内置 CA 签，不消耗 ACME 配额）"
+      else
+        ok "Caddy 的域名来自 .env 的 $dvar = $caddy_hosts"
+      fi
+      ;;
+    *) caddy_hosts=$caddy_site ;;
+  esac
+
+  local pair what val
+  for pair in "web/astro.config.mjs 的 site|$site" ".env 的 CAIRN_URL|$url" "Caddy 的域名|$caddy_hosts"; do
+    what=${pair%%|*}; val=${pair#*|}
+    if [ -z "$val" ]; then
+      [ -f "$ENVFILE" ] || continue      # 没有 .env，上面说过了
+      warn "$what 读不出来" "手动确认一眼它已经换成真域名了"
+    elif printf '%s' "$val" | grep -q 'example\.com'; then
+      bad "$what 还是占位域名（$val）" "换成你自己的域名"
+      placeholder=1
+    fi
+  done
+  [ "$placeholder" -eq 0 ] && [ -n "$site$url$caddy_hosts" ] && ok "没有一处还写着 example.com"
+
+  # 三处必须指同一个域名。不一致比占位符更难查：Caddy 给 A 签证书、canonical 写着 B，
+  # 站是通的，只是每一页都在把权重送给 B。
+  host=$(url_host "$url"); shost=$(url_host "$site")
+  # 通配符只能出现在 Caddy 的站点地址里（它是一批要签证书的域名），
+  # 不能出现在 CAIRN_URL 和 astro 的 site 里——那两个是**要被拼进链接的地址**：
+  # canonical、og:url、sitemap 的 <loc>、Telegram 确认里的那条链接、scripts/n 打的地址。
+  # `https://*.example.org/e/xxx/` 是个谁也打不开的 URL，而构建**不会**报错，
+  # 它照样生成整站，只是每一页的 canonical 都指向一个不存在的主机（实测如此）。
+  case "$host$shost" in
+    *'*'*) bad "CAIRN_URL / astro 的 site 里有通配符（CAIRN_URL=$url，site=$site）" \
+               "这两个是要被拼进链接的地址（canonical、og:url、sitemap、Telegram 的确认链接），通配符拼出来是个打不开的 URL" \
+               "构建不会因此失败——它照样出整站，只是每一页都指向一个不存在的主机" \
+               "CAIRN_DOMAIN 里可以有通配符（那是给 Caddy 签证书用的），但要把一个具体域名放在**第一个**" ;;
+  esac
+  if [ -n "$host" ] && [ -n "$shost" ] && [ "$host" != "$shost" ]; then
+    bad "CAIRN_URL 的主机（$host）和 astro 的 site（$shost）不是同一个域名" \
+        "canonical 用的是 site，Telegram 的确认链接用的是 CAIRN_URL——对不上，链接会点到另一个站去"
+  fi
+  if [ -n "$host" ] && [ -n "$caddy_hosts" ]; then
+    case " $(printf '%s' "$caddy_hosts" | tr -s ' ') " in
+      *" $host "*) ok "Caddy 会给 $host 签证书，和 CAIRN_URL 一致" ;;
+      *) bad "Caddy 的域名是「$caddy_hosts」，里面没有 $host" \
+             "Caddy 只给自己配置里写着的域名签证书，访问 $host 会直接连不上" \
+             "多域名用**空格**分隔，不能用逗号（Caddy 会直说 Site addresses cannot contain a comma）" ;;
+    esac
+  fi
+  case "$url" in
+    https://*|"") ;;
+    *) warn "CAIRN_URL 不是 https:// 开头（$url）" "Telegram 的 webhook 只认公开可信的 HTTPS 证书" ;;
+  esac
+
+  # ── 到这里为止读的都是本地文件。下面两条要出网。
+  if [ "$OFFLINE" -eq 1 ]; then
+    warn "--offline：跳过 DNS 与公网 IP 的比对" "正式部署前记得单独跑一次不带 --offline 的"
+    return
+  fi
+  local dnshost=${host:-$(printf '%s' "$caddy_hosts" | awk '{print $1}')}
+  if [ -z "$dnshost" ] || printf '%s' "$dnshost" | grep -q 'example\.com'; then
+    warn "还不知道要查哪个域名，跳过 DNS" "先把上面那几处域名填对"
+    return
+  fi
+  case "$dnshost" in
+    localhost|127.0.0.1|*.localhost)
+      ok "域名是 $dnshost —— 这是演练部署（Caddy 用内置 CA 签，不碰 ACME），DNS 不用查"
+      return ;;
+  esac
+
+  local ips=""
+  if have dig; then ips=$(run 10 dig +short +timeout=3 A "$dnshost" 2>/dev/null | grep -E '^[0-9.]+$')
+  elif have getent; then ips=$(run 10 getent ahostsv4 "$dnshost" 2>/dev/null | awk '{print $1}' | sort -u)
+  else warn "本机没有 dig 也没有 getent，查不了 DNS" "装一个：sudo apt install dnsutils"; return
+  fi
+
+  if [ -z "$ips" ]; then
+    warn "$dnshost 现在解析不出 A 记录" \
+         "这是警告不是错误：可以先部署、后解析" \
+         "但在解析生效之前证书签不下来（ACME 要能回访到这台机器），站是打不开的" \
+         "去域名商那里把 A 记录指到这台机器的公网 IP"
+    return
+  fi
+
+  # 公网 IP 拿不到时（机器不出网、探测点都挂了）必须降级成警告：
+  # 把「查不了」说成「不对」，会让人去改一条本来是对的 DNS 记录。
+  local myip="" probe
+  for probe in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+    myip=$(run 8 curl -fsS --max-time 5 "$probe" 2>/dev/null | tr -d '[:space:]')
+    printf '%s' "$myip" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' && break
+    myip=""
+  done
+  if [ -z "$myip" ]; then
+    warn "$dnshost 解析到 $(one_line "$(echo $ips)")，但拿不到本机公网 IP，没法比对" \
+         "自己确认一眼：那个 IP 是不是这台机器"
+    return
+  fi
+  if printf '%s\n' $ips | grep -qx "$myip"; then
+    ok "$dnshost 解析到 $myip，就是本机"
+  else
+    warn "$dnshost 解析到 $(one_line "$(echo $ips)")，而本机公网 IP 是 $myip" \
+         "对不上的话证书签不下来：ACME 的挑战会打到那个 IP 上，不是这台机器" \
+         "套了 CDN / 代理（Cloudflare 那类）的话，对不上是正常的，忽略即可" \
+         "没套的话，就是 A 记录还没改、或者还没生效（dig +trace $dnshost 看一眼）"
+  fi
+}
+
+# ── 构建这一侧：磁盘、node、go、Caddyfile ───────────────────────────────────
+sec_build() {
+  echo "构建与磁盘："
+
+  # 两个文件系统要分开看：仓库这边放 node_modules 和构建产物，/var/lib/docker 那边放镜像
+  #（golang:1.26-alpine 的构建层 + caddy 镜像）。它们经常不在同一个分区上，只看一个会漏。
+  check_space "$ROOT" 1 3 "仓库（node_modules + 构建产物）"
+  [ -d /var/lib/docker ] && check_space /var/lib/docker 2 5 "docker 镜像层"
+
+  # node：scripts/publish 要用它构建静态产物。
+  # 已经有构建好的 dist 时降级成警告——产物是可以在别处构建好再传上来的。
+  if have node; then
+    local nv; nv=$(node -p 'process.versions.node' 2>/dev/null)
+    if node_supported "$nv"; then
+      ok "node $nv（astro 5 要 ^18.20.8 || ^20.3.0 || >=22）"
+    else
+      bad "node $nv 太老，astro 5 跑不起来" \
+          "要 ^18.20.8 || ^20.3.0 || >=22。装新的：https://github.com/nodesource/distributions"
+    fi
+  elif [ -f "$ROOT/web/dist/index.html" ]; then
+    warn "没有 node，但 web/dist 里已经有构建好的产物" \
+         "这台机器上重新构建不了：改了内容之后，产物要在别处构建好再传上来"
+  else
+    bad "没有 node，而 web/dist 里也没有构建好的产物 → 站上一页都没有" \
+        "scripts/publish 要用它。装：https://github.com/nodesource/distributions" \
+        "或者在别的机器上构建好，把 web/dist 整个传上来"
+  fi
+
+  # go：服务端在镜像里构建（deploy/Dockerfile.server 用的是 golang:1.26-alpine），
+  # 宿主机上有没有 go 都不影响部署。所以没有 go **不报警告**——
+  # 一条「没装 go」的警告只会让人去装一个用不上的东西，而警告一多就没人看了。
+  if have go; then
+    ok "go $(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')（其实用不着：服务端在镜像里构建）"
+  else
+    ok "没有 go —— 不影响：服务端在 golang:1.26-alpine 镜像里构建"
+  fi
+
+  if [ ! -f "$CADDYFILE" ]; then
+    bad "没有 $CADDYFILE"
+    return
+  fi
+  # 宿主机上没有 caddy 二进制是正常的（它现在跑在容器里），所以验不了只是跳过。
+  if have caddy; then
+    # Caddyfile 里的 {$VAR} 是**运行时**从环境里取的，validate 也一样。
+    # 不把 .env 里的值传进去就直接 validate，Caddy 报的是
+    #   Error: ... unrecognized global option: encode
+    # ——站点地址那一行空了，整个块被当成全局选项块解析。这条报错和真正的原因
+    # 完全对不上（实测如此，Caddyfile 顶上那段注释也记了这一脚），而自检要是照抄这句话，
+    # 就是**它自己制造了一个「症状和原因对不上」的故障**，比不查还坏。
+    local out cv miss="" ; local -a cenv=()
+    for cv in $(grep -oE '\{\$[A-Za-z_][A-Za-z0-9_]*' "$CADDYFILE" 2>/dev/null | sed 's/^{\$//' | sort -u); do
+      if [ -n "$(envget "$cv")" ]; then cenv+=("$cv=$(envget "$cv")"); else miss="$miss $cv"; fi
+    done
+    if [ -n "$miss" ]; then
+      warn "跳过 caddy validate：Caddyfile 引用的${miss} 在 .env 里还是空的" \
+           "空着验的话 Caddy 会报「unrecognized global option: encode」，而那和真正的原因（域名没配）对不上" \
+           "填好域名再跑一次这个自检"
+    elif { [ ${#cenv[@]} -eq 0 ] && out=$(run 30 caddy validate --config "$CADDYFILE" --adapter caddyfile 2>&1); } ||
+         { [ ${#cenv[@]} -gt 0 ] && out=$(run 30 env "${cenv[@]}" caddy validate --config "$CADDYFILE" --adapter caddyfile 2>&1); }; then
+      # 分两条写而不是 `env "${cenv[@]}"` 一条：数组为空时展开 "${arr[@]}" 在老 bash
+      # （macOS 自带的 3.2）里会当成未绑定变量报错——一个只在别人机器上崩的自检。
+      ok "caddy validate 通过$([ ${#cenv[@]} -gt 0 ] && printf '（带上了 .env 里的 %s）' "${cenv[*]%%=*}")"
+    else
+      # 只留 Error: 那一行。Caddy 会往 stderr 上刷一串 JSON 日志，整段贴出来会把结论埋掉。
+      bad "caddy validate 不通过" "caddy 说：$(one_line "$(printf '%s\n' "$out" | grep -m1 '^Error:' || printf '%s' "$out")")"
+    fi
+  else
+    warn "本机没有 caddy 二进制，Caddyfile 只做了文本检查" \
+         "要真验一遍：docker run --rm -v '$CADDYFILE':/c/Caddyfile caddy caddy validate --config /c/Caddyfile --adapter caddyfile"
+  fi
+
+  # deploy/README.md：删掉 handle_errors = 站上没有 404 页。
+  # file_server 找不到文件时不会自己去用同目录下的 404.html。
+  if ! grep -q 'handle_errors' "$CADDYFILE"; then
+    bad "Caddyfile 里没有 handle_errors" \
+        "没有它，web/src/pages/404.astro 构建出来的那一页永远发不出去，线上 404 是 Caddy 自带的空白页"
+  elif ! grep -q 'status 404' "$CADDYFILE"; then
+    bad "Caddyfile 的 handle_errors 里没有 file_server { status 404 }" \
+        "发一个存在的文件默认是 200，于是「找不到」会以 200 发出去（soft 404）" \
+        "搜索引擎会把这张页当正文收录；而 unlisted 那套「猜不到」的防护，前提正是猜错时得到明确的否定"
+  else
+    ok "Caddyfile 里 handle_errors 和 file_server { status 404 } 都在"
+  fi
+
+  # docroot 得真的能发出东西，否则站上每一页都是 404。
+  # Caddy 现在在容器里，所以那是个**容器内**路径：先去 compose 的挂载里找它的来源，
+  # 找到了再去看宿主机上对应的目录在不在。
+  local docroot; docroot=$(sed -n 's/^[[:space:]]*root \* \(.*\)$/\1/p' "$CADDYFILE" | head -1)
+  [ -n "$docroot" ] || return 0
+  local src dst best_src="" best_dst="" hostpath
+  while IFS=$'\t' read -r src dst; do
+    case "$docroot/" in
+      "$dst"/*) [ ${#dst} -gt ${#best_dst} ] && { best_src=$src; best_dst=$dst; } ;;
+    esac
+  done < <(compose_binds)
+  if [ -z "$best_dst" ]; then
+    if [ -d "$docroot" ]; then
+      ok "Caddy 的 docroot $docroot 在本机上（Caddy 是宿主机原生跑的那种形态）"
+    else
+      warn "Caddy 的 docroot 是 $docroot，本机上没有这个目录，compose 里也没有映射到它的挂载" \
+           "站上每一页都会是 404。要么在 compose 里把 web/ 挂到那个路径上，要么改 Caddyfile 的 root"
+    fi
+    return
+  fi
+  hostpath="$best_src${docroot#"$best_dst"}"
+  if [ -d "$hostpath" ]; then
+    ok "Caddy 的 docroot $docroot ← 宿主机 $hostpath"
+  elif [ -d "$best_src" ]; then
+    warn "docroot 对应的宿主机目录还不存在：$hostpath" \
+         "第一次部署时正常——scripts/publish 构建完就有了。发布之前站上是 404"
+  else
+    bad "docroot 对应的宿主机目录不存在，连挂载源 $best_src 都不在" \
+        "dockerd 会以 root 建出那个空目录，之后 scripts/publish 换产物时会被属主绊住" \
+        "确认仓库确实在 $ROOT，且 compose 里的相对路径是对的"
+  fi
+}
+
+# check_space <路径> <致命阈值GiB> <警告阈值GiB> <说明>
+check_space() {
+  local path=$1 hard=$2 soft=$3 what=$4 kb gib
+  kb=$(df -Pk "$path" 2>/dev/null | tail -1 | awk '{print $4}')
+  if [ -z "$kb" ]; then warn "查不了 $path 的剩余空间"; return; fi
+  gib=$((kb / 1024 / 1024))
+  if [ "$gib" -lt "$hard" ]; then
+    bad "$what所在分区只剩 ${gib}G（$path）" \
+        "构建到一半磁盘满的话，产物会是半截的。腾一点：docker system prune -af"
+  elif [ "$gib" -lt "$soft" ]; then
+    warn "$what所在分区只剩 ${gib}G（$path）" "够这一次，但不宽裕"
+  else
+    ok "$what所在分区剩 ${gib}G"
+  fi
+}
+
+# astro 5 的 engines：^18.20.8 || ^20.3.0 || >=22.0.0。
+# 抄一份而不是去 node_modules 里读：这条检查要在 npm ci 之前就能跑，
+# 而「node 太老」正是 npm ci 会失败的原因之一。
+node_supported() {
+  local M m p
+  IFS=. read -r M m p <<<"${1//[!0-9.]/}"
+  M=${M:-0}; m=${m:-0}; p=${p:-0}
+  [ "$M" -ge 22 ] && return 0
+  [ "$M" -eq 20 ] && [ "$m" -ge 3 ] && return 0
+  [ "$M" -eq 18 ] && { [ "$m" -gt 20 ] || { [ "$m" -eq 20 ] && [ "$p" -ge 8 ]; }; } && return 0
+  return 1
+}
+
+echo "部署前自检（$ROOT）："
+echo
+for s in $SECTIONS; do
+  case "$s" in
+    tools)   sec_tools; sec_tools_docker ;;
+    ports)   sec_ports ;;
+    env)     sec_env ;;
+    content) sec_content ;;
+    domain)  sec_domain ;;
+    build)   sec_build ;;
+  esac
+  echo
+done
+
+if [ "$fatals" -eq 0 ] && [ "$warns" -eq 0 ]; then
+  echo "全部通过，可以部署。"
+elif [ "$fatals" -eq 0 ]; then
+  echo "$warns 条警告，没有致命项 —— 可以部署（警告是「还差点什么」，不是「起不来」）。"
+else
+  echo "$fatals 条致命，$warns 条警告。修完致命项再部署。"
+fi
+# 封到 63：再多也没有意义，而 126 / 127 / 128+n 是 shell 自己的地盘，撞上会被误读成信号。
+[ "$fatals" -gt 63 ] && fatals=63
+exit "$fatals"

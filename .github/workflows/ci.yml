@@ -91,6 +91,26 @@ jobs:
           done
           exit $fail
 
+  # 两个部署脚本加起来两千行 bash，而它们都是 `set -uo pipefail` 不带 -e
+  # （理由写在脚本注释里，成立）——也就是说任何一处漏判返回值都会静默往下走。
+  # shellcheck 抓的正是这一类。这台开发机上没装它，所以只能在 CI 里兜。
+  shell:
+    name: shell 脚本
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: 语法
+        run: for f in scripts/*; do bash -n "$f" || exit 1; done
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # SC1090/SC1091（source 的目标解析不了）在这些脚本里是误报：
+          # 它们 source 的是运行时才存在的 .env。
+          shellcheck -e SC1090,SC1091 scripts/deploy scripts/preflight \
+                                      scripts/publish scripts/seed scripts/n \
+                                      scripts/test-visibility .githooks/commit-msg
+
   web:
     name: web（Astro）+ 可见度性质
     runs-on: ubuntu-latest

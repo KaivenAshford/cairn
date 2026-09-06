@@ -68,13 +68,18 @@
   词表从 `write.go` 的三张校验表在 init 里生成,加一个 type 值手机端自动跟上。
 - **第一个数据模块** `/ai`:`pipeline/` 是独立 Go module,流式读 transcript,
   按天增量快照(同一天取事件更多的那份,所以在没有 transcript 的机器上跑一遍不会清空历史)。
-- **CI**:`.github/workflows/ci.yml`,三个并行 job(server / commit / web)。
+- **一键部署**:`scripts/deploy`(引导式问答,可重复跑;`--update` / `--dry-run`)。
+  Caddy 已经进 compose——服务器上除了 Docker 什么都不用装。动手前自动跑 `scripts/preflight`,
+  它把 deploy/README 里「容易踩的几脚」变成了可执行检查。
+- **CI**:`.github/workflows/ci.yml`,四个并行 job(server / commit / shell / web)。
   注意 CI 上 `web/content/entries/` 不存在,web job 必须先跑 `scripts/seed`。
 
 `server/` **48 个测试**,`pipeline/` **17 个**,`scripts/test-visibility` **92 条**性质。
 三套都做过变异验证(把实现改坏,确认断言真的会失败)。
 
-**未实现**:`/circle/*` 的会话与渲染、magic link、写入后自动重建、部署。
+**未实现**:`/circle/*` 的会话与渲染、magic link、写入后自动重建。
+部署脚本写好了但**从没在真机上跑过**——这台开发机没有 docker/caddy,
+起容器之后的那批断言(尤其「Caddy 容器里 web/content 必须是空的」)第一次上服务器要单独确认。
 `circle` 的前置问题是「哪些内容值得放进去」——那是内容判断,不是工程任务,
 在有第一条真正想放进去的东西之前做了也是空的。
 
@@ -110,6 +115,10 @@ n -i now "在建这个站"                               # 按 id 更新已有�
 n -g tsgo,编译器 "正文"                            # 带标签
 
 cd pipeline && go run ./ai                        # 采集 transcript 统计 → web/src/data/ai.json
+
+scripts/preflight                                 # 部署前自检
+scripts/deploy --dry-run                          # 看它打算做什么
+scripts/deploy                                    # 一键部署（引导式）
 
 scripts/publish                                   # 构建并发布(不要直接 npm run build)
 

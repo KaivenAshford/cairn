@@ -1,0 +1,1167 @@
+#!/usr/bin/env bash
+# 一键部署。第一次问三个问题，之后是一条命令。
+#
+#   scripts/deploy              第一次：引导式问答 + 全套部署
+#   scripts/deploy --update     之后：拉代码、重新构建发布、重启服务，再把端点验一遍
+#   scripts/deploy --dry-run    只说要做什么，一个字节都不改
+#
+# 真正需要人做、这个脚本替不了的只有四件：
+#
+#   1. 买域名，把 A 记录指到这台机器的公网 IP
+#   2. 找 @BotFather 拿 bot token（可以跳过 = 不开 Telegram 那条通道）
+#   3. 建内容私有仓，并给这台机器配好能 clone 它的凭证（deploy key / ssh-agent）
+#   4. 决定域名叫什么
+#
+# 其余全部在这里面：装 Docker、clone 内容仓、生成密钥、换占位域名、构建发布、
+# 起容器、等证书、setWebhook、逐个端点验活。
+#
+# ── 为什么要有这个脚本 ──────────────────────────────────────────────────────
+# 从前是手动 11 步（主流程 6 步 + Telegram 5 步），而 deploy/README.md 的
+# 「容易踩的几脚」里记着好几处**症状和原因对不上**的坑：uid 填错的症状是「每条写入
+# 都 500」、改了 secret 忘了重新 setWebhook 的症状是「bot 一条也不回，而且不报错」。
+# 11 步里每一步都能踩，而踩了之后你看到的东西不指向踩的那一脚。
+# 把这 11 步写成脚本，坑就从「记住它」变成「跑过一遍就不会再有」。
+#
+# ── 这个脚本的三条取向 ──────────────────────────────────────────────────────
+#
+# **幂等。** 第二次跑是更新不是重装。.env 已存在就一个字不动（里面那个 CAIRN_TOKEN
+# 是所有客户端配好的那个，覆盖它等于把 ~/.cairnrc 和 Telegram 一起弄坏），内容仓已
+# clone 就 pull，域名已经换过就跳过。凡是「改已有的东西」的动作，这里只做两种：
+# 往 .env **追加**缺的键（不动已有的行），以及把 astro.config.mjs 里那个**还是占位符**
+# 的域名换掉（不是占位符就停下来问，绝不覆盖一个真域名）。
+#
+# **宁可停下来问，不要猜一个默认值往下走。** 这是 server/ 那边的取向（CAIRN_TOKEN
+# 没配就 log.Fatalf，Telegram 半配就拒绝启动），脚本这边同样：答不上来的问题不填默认值，
+# 没有 tty 就直接退出而不是「按默认继续」。
+#
+# **每一步做完要验证它真的成了。** 「命令返回 0」不算：docker compose up 返回 0 只说明
+# 容器创建了，不说明它没在崩溃循环；Caddy 起来了不说明证书签下来了。所以每一步后面
+# 都跟一条断言，失败时说清楚「症状是什么、真正的原因在哪、下一步敲什么」。
+#
+# ── 密钥 ────────────────────────────────────────────────────────────────────
+# 生成的 CAIRN_TOKEN 和 webhook secret 只出现在两个地方：.env（权限 600）和这个进程的
+# 内存。**不回显、不进日志、不进 shell 历史**，摘要里也只说「已写入 .env」。
+# 调 HTTP 时一律用 `curl --config -`（配置从管道进，不是文件、更不是 heredoc——bash 的
+# heredoc 会在 $TMPDIR 里落一个临时文件），因为写在命令行上的密钥，同机器上任何一个
+# 用户 `ps auxww` 都能看见。bot token 更进一步：连 .env 都不写，只在内存里活到
+# setWebhook 调完为止——服务端本来就不保存它（见 deploy/README.md），少存一个凭证
+# 就少一个泄露面，而它恰好是唯一一个能冒充这个 bot 的凭证。
+#
+# ── 失败了会留下什么 ────────────────────────────────────────────────────────
+# 每一步的可回滚性不一样，这里按它本来的样子处置，不假装能整体回滚：
+#
+#   .env             失败也保留。里面是**这次生成的**密钥，删了就再也拿不回来；
+#                    留着的话下次跑会原样复用，这正是幂等要的。
+#   内容仓 clone     半截的 clone 会被删掉（只删这个脚本自己建的那个目录）。
+#   astro 的域名     换完立刻读回来核对，对不上就从 .bak 还原。
+#   构建发布         scripts/publish 本来就是原子的：构建到 dist.next，成功了才 rename。
+#                    失败时线上产物一个字节没动。
+#   容器             失败时**不**停掉、不删——日志是唯一的线索，而 down 会把它冲掉。
+#                    脚本会把最后几十行日志打出来，并告诉你接着看什么。
+#
+# 退出码：0 成功；1 出错停在原地；3 preflight 有致命项；64 用法错误。
+set -uo pipefail
+
+# 不用 `set -e`。这个脚本的每一步都要在失败时说清楚「下一步敲什么」，
+# 而 -e 是在半路无声退出——那正好是这个脚本要消灭的那类故障。
+
+SELF=$0
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$SELF_DIR/.." && pwd)
+ENVFILE="$ROOT/.env"
+COMPOSE="$ROOT/deploy/docker-compose.yml"
+CADDYFILE="$ROOT/deploy/Caddyfile"
+ASTROCFG="$ROOT/web/astro.config.mjs"
+
+MODE=first          # first | update
+DRY=0
+ARG_DOMAIN=""
+ARG_REPO=""
+WANT_TG=auto        # auto | never | force
+DO_PULL=1
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --update)        MODE=update; shift ;;
+    --dry-run|-n)    DRY=1; shift ;;
+    --domain)        ARG_DOMAIN=${2:-}; shift 2 ;;
+    --domain=*)      ARG_DOMAIN=${1#--domain=}; shift ;;
+    --content-repo)  ARG_REPO=${2:-}; shift 2 ;;
+    --content-repo=*) ARG_REPO=${1#--content-repo=}; shift ;;
+    --no-telegram)   WANT_TG=never; shift ;;
+    --telegram)      WANT_TG=force; shift ;;
+    # --no-pull 是 --update 自己用的：拉完代码之后脚本会把新的自己 exec 起来，
+    # 带上这个开关免得再拉一次。见 update_code。
+    --no-pull)       DO_PULL=0; shift ;;
+    -h|--help)       sed -n '2,16p' "$0" | sed 's/^#\{1,\} \{0,1\}//'; exit 0 ;;
+    *) echo >&2 "不认识的参数：$1（--help 看用法）"; exit 64 ;;
+  esac
+done
+
+# ── 输出 ────────────────────────────────────────────────────────────────────
+# 颜色只在终端里上。管道里（tee 进部署日志、CI）要的是能 grep 的纯文本。
+if [ -t 1 ]; then C_OK=$'\033[32m'; C_BAD=$'\033[31m'; C_WARN=$'\033[33m'; C_DIM=$'\033[2m'; C_B=$'\033[1m'; C_OFF=$'\033[0m'
+else C_OK=""; C_BAD=""; C_WARN=""; C_DIM=""; C_B=""; C_OFF=""; fi
+
+step() { printf '\n%s── %s ──%s\n' "$C_B" "$1" "$C_OFF"; }
+ok()   { printf '  %s✓%s %s\n' "$C_OK" "$C_OFF" "$1"; }
+info() { printf '  %s·%s %s\n' "$C_DIM" "$C_OFF" "$1"; }
+warn() { printf '  %s!%s %s\n' "$C_WARN" "$C_OFF" "$1"; shift; for l in "$@"; do printf '      %s\n' "$l"; done; }
+plan() { printf '  %s→%s %s\n' "$C_DIM" "$C_OFF" "$1"; }
+# 第一个参数是结论，后面每个参数是一行「下一步敲什么」。停在原地，不清理已经做成的部分。
+die() {
+  printf '  %s✗%s %s\n' "$C_BAD" "$C_OFF" "$1"; shift
+  # 空参数直接跳过：报错里夹一行空的缩进，会让人以为下面还有话没打出来。
+  for l in "$@"; do [ -n "$l" ] && printf '      %s\n' "$l"; done
+  printf '\n%s部署停在这里。%s修完之后再跑一次 %s——已经做完的步骤会自动跳过。\n' "$C_BAD" "$C_OFF" "$SELF"
+  exit 1
+}
+dry() { [ "$DRY" -eq 1 ]; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ── 临时目录 ────────────────────────────────────────────────────────────────
+# 只在真跑的时候建。放 curl 的响应体和 sed 的备份，退出时删掉。
+TMPD=""
+cleanup() { [ -n "$TMPD" ] && rm -rf "$TMPD"; }
+trap cleanup EXIT
+if ! dry; then
+  TMPD=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/cairn-deploy.XXXXXX") || { echo >&2 "建不了临时目录"; exit 1; }
+fi
+
+# ── 问答 ────────────────────────────────────────────────────────────────────
+# 没有 tty 就不问。猜一个默认值往下走是这个仓库明确拒绝的做法，而「域名猜错」的后果
+# 是给一个谁也没在用的域名签证书，站打不开而配置文件看着完全正常。
+tty_ok() { [ -t 0 ] || { [ -c /dev/tty ] && (exec 3</dev/tty) 2>/dev/null; }; }
+ask() { # ask <提示> <变量名>
+  local prompt=$1 __var=$2 reply=""
+  tty_ok || die "没有终端可以提问，而「$prompt」这个问题必须有人回答" \
+                "用命令行参数把答案给进来：--domain / --content-repo" \
+                "或者在一个真的终端里跑一次（第一次部署只要跑一次，之后 --update 不问任何问题）"
+  if [ -t 0 ]; then read -r -p "  $prompt" reply
+  else read -r -p "  $prompt" reply < /dev/tty; fi
+  printf -v "$__var" '%s' "$reply"
+}
+ask_secret() { # 同上，但不回显（bot token 走这条）
+  local prompt=$1 __var=$2 reply=""
+  tty_ok || die "没有终端可以提问" "要跳过 Telegram：--no-telegram"
+  if [ -t 0 ]; then read -rs -p "  $prompt" reply; else read -rs -p "  $prompt" reply < /dev/tty; fi
+  echo
+  printf -v "$__var" '%s' "$reply"
+}
+confirm() { # confirm <问题>；默认否——「按回车就干」不该出现在会改机器的动作上
+  local reply=""
+  tty_ok || return 1
+  if [ -t 0 ]; then read -r -p "  $1 [y/N] " reply; else read -r -p "  $1 [y/N] " reply < /dev/tty; fi
+  case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# ── 读 .env 里的一个键 ──────────────────────────────────────────────────────
+# 和 scripts/preflight 里的 envget 是同一份 awk，故意抄一份而不是 source 那个脚本：
+# preflight 被 source 就会**跑一遍**。而不用 shell 的 `source .env` 读配置，理由更硬：
+# 那份文件是给 docker compose 的 env_file 用的，不是 shell 脚本，里面一行
+# `CAIRN_TOKEN=$(rm -rf ~)` 对 compose 只是字面量，对 source 是执行。
+# 另外 source 会把密钥灌进本进程的环境，之后任何一处 `env`、任何一次
+# `docker run` 忘了挡都可能把它带出去。
+envget() {
+  [ -f "$ENVFILE" ] || return 1
+  awk -v k="$1" '
+    { line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (line ~ /^#/ || line == "") next
+      sub(/^export[[:space:]]+/, "", line)
+      i = index(line, "=")
+      if (i == 0) next
+      key = substr(line, 1, i - 1); val = substr(line, i + 1)
+      sub(/[[:space:]]+$/, "", key)
+      if (key != k) next
+      if (val ~ /^".*"$/ || val ~ /^'"'"'.*'"'"'$/) val = substr(val, 2, length(val) - 2)
+      out = val; found = 1
+    }
+    END { if (found) print out }
+  ' "$ENVFILE"
+}
+envhas() { [ -n "$(envget "$1")" ]; }
+
+# envreal：这个键有没有一个**真实**的值。
+# 「值存在」和「值有用」是两回事：`cp .env.example .env` 是个太自然的动作，
+# 而模板里 CAIRN_DOMAIN / CAIRN_URL 是 example.com。只看 envhas 的话，
+# 脚本会认为「域名已经配好了」于是一个问题都不问，一路走到 preflight 才停下——
+# 「跑 scripts/deploy 它问你几个问题」这个体验就没了，而这正是一键的全部意义。
+# 占位值当成没配来处理，问答才回得来。
+envreal() {
+  local v; v=$(envget "$1")
+  case "$v" in
+    ''|*example.com*|*example.org*|*example.net*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# 32 字节的随机十六进制。openssl 不在时用 /dev/urandom 顶上——
+# 为了一个密钥去装一个包，是这条部署链上最不该有的一次「还差点什么」。
+# 失败时**返回非零**而不是 die：这个函数总是在 $(...) 里被调用，而 die 在命令替换的
+# 子 shell 里只结束那个子 shell——它那句话会被当成返回值捕获，于是「生成失败」变成
+# 「.env 里有一个由报错文本组成的 token」。所以这里只返回状态，让调用方去 die。
+# 顺带把结果验一眼（64 位十六进制）：一个不合格的密钥写进 .env，症状是容器拒绝启动。
+gen_secret() {
+  local s=""
+  if have openssl; then s=$(openssl rand -hex 32 2>/dev/null)
+  elif [ -r /dev/urandom ]; then s=$(od -An -tx1 -N32 /dev/urandom 2>/dev/null | tr -d ' \n')
+  fi
+  printf '%s' "$s" | grep -qE '^[0-9a-f]{64}$' || return 1
+  printf '%s' "$s"
+}
+NO_RANDOM=("生成不了随机密钥" "既没有 openssl 也读不了 /dev/urandom：sudo apt install openssl")
+
+# ── docker compose 的固定调法 ───────────────────────────────────────────────
+# --env-file 不是可选的：compose 的变量替换读的是**项目目录**下的 .env，而项目目录
+# 默认是 compose 文件所在的 deploy/，不是仓库根。少了它，${CAIRN_DOMAIN:?} 会报
+# 「没配 CAIRN_DOMAIN」——而 .env 里明明填着，这是最典型的「症状和原因对不上」。
+dc() { docker compose --env-file "$ENVFILE" -f "$COMPOSE" "$@"; }
+
+# ════════════════════════════════════════════════════════════════════════════
+# 步骤
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── 0. 手边的工具 ───────────────────────────────────────────────────────────
+# 这一步**不**调 preflight，是有意的：preflight 的 tools 段里有一条「compose 要求的
+# 变量在 .env 里都有值吗」，而第一次部署时 .env 还不存在——那条必然红，红得没有信息。
+# preflight 回答的是「这台机器现在能不能部署」，这个脚本要做的是「把它变成能部署」。
+# 所以顺序是：先确认几件**问答也补不上**的东西（docker、git），再问、再配，
+# 配完之后跑一次完整的 preflight（那时候它每一条都有意义），最后才动手。
+sec_tools() {
+  step "手边的工具"
+  for c in git curl; do
+    have "$c" || die "没有 $c" "sudo apt install $c"
+  done
+  ok "git、curl 都在"
+
+  if have docker && docker compose version >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    ok "docker $(docker --version 2>/dev/null | sed 's/^Docker version //; s/,.*//') + compose $(docker compose version --short 2>/dev/null)，守护进程连得上"
+    return 0
+  fi
+  if dry; then
+    plan "装 Docker（curl -fsSL https://get.docker.com | sh），装完确认守护进程连得上"
+    return 0
+  fi
+  if have docker && ! docker info >/dev/null 2>&1; then
+    local why; why=$(docker info 2>&1 | head -3)
+    if printf '%s' "$why" | grep -qi 'permission denied'; then
+      die "有 docker，但当前用户读不了 /var/run/docker.sock" \
+          "sudo usermod -aG docker \$USER，然后**重新登录**再跑一次" \
+          "（newgrp docker 只对当前这个 shell 生效，下一个终端里又会失败——最像玄学的那类故障）"
+    fi
+    die "有 docker，但连不上守护进程" "sudo systemctl enable --now docker" "docker 说：$(printf '%s' "$why" | tr '\n' ' ')"
+  fi
+  warn "没有 docker（或者没有 compose 插件）" "整个部署只依赖这一件事——服务器上除了 Docker 什么都不用装"
+  if ! confirm "现在装？（等价于 curl -fsSL https://get.docker.com | sh）"; then
+    die "没装 docker，接着往下也起不来容器" \
+        "自己装：curl -fsSL https://get.docker.com | sh" \
+        "装完把自己加进 docker 组：sudo usermod -aG docker \$USER，然后重新登录"
+  fi
+  local sudo=""; [ "$(id -u)" -ne 0 ] && sudo=sudo
+  # 管道进 shell 是这条链上唯一一次「把网上的东西直接执行」。所以先把脚本落到本地、
+  # 打印一眼它多大、来自哪里，再执行——至少不是盲跑。
+  curl -fsSL https://get.docker.com -o "$TMPD/get-docker.sh" || die "下载 get.docker.com 失败" "网络不通？手动装一遍再跑这个脚本"
+  info "已下载 get-docker.sh（$(wc -c <"$TMPD/get-docker.sh" | tr -d ' ') 字节），来自 https://get.docker.com"
+  $sudo sh "$TMPD/get-docker.sh" || die "Docker 装失败" "照官方文档手动装一遍：https://docs.docker.com/engine/install/"
+  docker info >/dev/null 2>&1 || die "Docker 装完了，但当前用户还连不上守护进程" \
+      "sudo usermod -aG docker \$USER，然后**重新登录**，再跑一次 $SELF"
+  ok "Docker 装好了，守护进程连得上"
+}
+
+# ── 1. 问三个问题 ───────────────────────────────────────────────────────────
+DOMAIN=""       # 第一个域名（证书、curl、CAIRN_URL 都用它）
+DOMAINS=""      # 全部域名，空格分隔（Caddy 支持多个）
+CONTENT_REPO=""
+TG_TOKEN=""     # 只在内存里，不落盘
+TG_ALLOW=""
+
+normalize_domain() { # 人会把 https:// 和结尾的 / 一起粘进来
+  printf '%s' "$1" | sed -e 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' -e 's#/.*$##' -e 's/[[:space:]]\{1,\}/ /g' -e 's/^ //' -e 's/ $//'
+}
+
+sec_ask() {
+  step "问三个问题"
+
+  # 域名。已经在 .env 里就不问——这是幂等的第一条。
+  if envreal CAIRN_DOMAIN; then
+    DOMAINS=$(envget CAIRN_DOMAIN); DOMAIN=${DOMAINS%% *}
+    # .env 里的值不会被改写（那是幂等的第一条），所以 --domain 给了个不一样的值时
+    # 必须停下来说清楚——否则后面每一步用的都是 .env 里那个，而人以为换了域名。
+    if [ -n "$ARG_DOMAIN" ] && [ "$(normalize_domain "$ARG_DOMAIN")" != "$DOMAINS" ]; then
+      die "--domain 给的是「$(normalize_domain "$ARG_DOMAIN")」，而 .env 里已经是「$DOMAINS」" \
+          "这个脚本不改写 .env 里已有的值（改了它，证书、canonical、~/.cairnrc 会各指一个域名）" \
+          "真要换域名：改 .env 的 CAIRN_DOMAIN 和 CAIRN_URL、改 web/astro.config.mjs 的 site，再跑 $SELF --update" \
+          "换域名会重新签一张证书，Let's Encrypt 对同一组域名每周 5 张，别反复试"
+    fi
+    ok ".env 里已经有 CAIRN_DOMAIN=$DOMAINS，不问了"
+  else
+    local d=$ARG_DOMAIN
+    if [ -z "$d" ]; then
+      if dry; then
+        DOMAINS="<你的域名>"; DOMAIN=$DOMAINS
+        plan "问：域名（不带 https://，多个用空格分开；演练部署填 localhost）"
+      else
+        echo "  域名要先在域名商那里把 A 记录指到这台机器的公网 IP——那是脚本替不了的四件事之一。"
+        echo "  只是想演练一遍就填 localhost：Caddy 会用内置 CA 签，完全不碰 ACME，不消耗签发配额。"
+        while [ -z "$d" ]; do ask "域名（不带 https://，多个用空格分开）：" d; d=$(normalize_domain "$d"); done
+      fi
+    else
+      d=$(normalize_domain "$d")
+    fi
+    if [ -n "$d" ] && ! dry; then
+      case "$d" in
+        *,*) die "域名里有逗号：$d" "多域名用**空格**分隔。Caddy 对逗号会直说 Site addresses cannot contain a comma" ;;
+        *example.com*) die "这还是占位域名：$d" "填你自己的域名；只想演练就填 localhost" ;;
+      esac
+      printf '%s' "$d" | grep -qE '^[A-Za-z0-9.*-]+( [A-Za-z0-9.*-]+)*$' || die "域名里有不该有的字符：$d" \
+          "只能是字母、数字、点、连字符（通配符 *.example.org 可以，但不能放在第一个）" \
+          "中文域名要填它的 punycode 形式（xn--… 开头）——证书签的是那个，浏览器地址栏里显示的才是中文"
+      DOMAINS=$d; DOMAIN=${DOMAINS%% *}
+      # 第一个域名不能是通配符。CAIRN_DOMAIN 整串是给 Caddy 签证书用的，通配符在那里
+      # 完全合法；但**第一个**那个还要被拿去做三件别的事——写进 CAIRN_URL、换进
+      # astro.config.mjs 的 site、以及验活时 curl 它。`https://*.example.org/` 谁也打不开。
+      # 而这一脚特别阴：构建**不会**失败（实测：照样出 10 个页面），只是每一页的
+      # canonical、og:url、sitemap 的 <loc> 都指向一个不存在的主机；真正停下来的地方是
+      # 三分钟后「首页拿不到 200」，而那句话给的原因是「证书签不下来 / A 记录没指过来」。
+      case "$DOMAIN" in
+        *'*'*) die "第一个域名是通配符：$DOMAIN" \
+                   "整串里可以有通配符（Caddy 会给它签证书），但第一个必须是一个能真的打开的具体域名" \
+                   "——CAIRN_URL、astro 的 site、验活时 curl 的地址都从第一个来" \
+                   "改成：--domain 'cairn.example.org *.cairn.example.org'" ;;
+      esac
+      ok "域名：$DOMAINS（证书和 CAIRN_URL 用第一个：$DOMAIN）"
+    fi
+  fi
+
+  # 内容私有仓。目录已经在就不问。
+  local dir; dir=$(content_dir)
+  if [ -d "$dir/.git" ] || [ -n "$ARG_REPO" ]; then
+    CONTENT_REPO=$ARG_REPO
+    [ -d "$dir/.git" ] && ok "内容目录已经是一个 git 仓库，不问了：$dir"
+  elif dry; then
+    plan "问：内容私有仓的 git 地址（回车跳过 = 先在本机 git init 一个）"
+  else
+    echo "  内容是**单独的 private 仓库**（见 web/content/README.md）：真实条目在里面，"
+    echo "  代码仓里一条都没有。不 clone 它的话，写进来的条目不受任何 git 管理——"
+    echo "  「服务器炸了不丢」的前提就没了，而且不会有任何报错提示你。"
+    ask "内容私有仓的 git 地址（回车跳过）：" CONTENT_REPO
+  fi
+
+  # Telegram。有 bot token 才开这条通道。
+  if [ "$WANT_TG" = never ]; then
+    info "--no-telegram：不开 Telegram 通道"
+  elif [ "$WANT_TG" != force ] && envhas CAIRN_TELEGRAM_SECRET && envhas CAIRN_TELEGRAM_ALLOW; then
+    ok "Telegram 在 .env 里已经配齐了，不问了（要重新 setWebhook 就带 --telegram 跑）"
+  elif dry; then
+    plan "问：Telegram bot token（输入不回显，回车跳过 = 不开这条通道）"
+  else
+    echo "  手机上发一条消息 → 站上一条记录。要一个 bot token（找 @BotFather 拿，形如 123456:AA...）。"
+    echo "  token **不会写进 .env**，只在内存里用一次去调 setWebhook——服务端本来就不保存它。"
+    ask_secret "Telegram bot token（不回显，回车跳过）：" TG_TOKEN
+    if [ -n "$TG_TOKEN" ]; then
+      printf '%s' "$TG_TOKEN" | grep -qE '^[0-9]{5,}:[A-Za-z0-9_-]{30,}$' ||
+        die "这不像一个 bot token" "@BotFather 给的形如 123456789:AAH...（数字 + 冒号 + 一串字母数字）" "确实不想开这条通道就带 --no-telegram 再跑"
+      ok "收到 bot token（不回显、不落盘）"
+      # allowlist 必须在**写 .env 之前**就认出来。半配（有 secret 没名单，或者反过来）
+      # 是唯一危险的状态，服务端会拒绝启动——而那时候容器已经在崩溃循环了，
+      # 症状（healthcheck 一直红）离原因（这里少问了一句）隔着好几步。
+      tg_identify
+    else
+      info "跳过 Telegram（两个变量都不填 = 这条路由根本不注册，/api/telegram 返回 404）"
+    fi
+  fi
+}
+
+# 认出「我是谁」——Telegram 的数字 user id。
+#
+# 从前这一步是那五步里最别扭的一步：先拿一个假名单把服务起起来，给 bot 发条消息，
+# 再去容器日志里 grep「拒绝来自」，把那个数字抄出来，重启。
+# 这里改成在登记 webhook **之前**先 getUpdates 认一次——顺序不能反：
+# webhook 一旦登记，Telegram 就会拒掉 getUpdates（409）。
+tg_identify() {
+  local allow; allow=$(envget CAIRN_TELEGRAM_ALLOW)
+  if [ -n "$allow" ]; then TG_ALLOW=$allow; ok "allowlist 已经在 .env 里：$allow"; return 0; fi
+
+  local r; r=$(tg_api getMe)
+  tg_ok "$r" || die "这个 bot token 用不了" "Telegram 说：$(tg_desc "$r")" "找 @BotFather 确认一遍"
+  ok "bot token 有效：@$(printf '%s' "$r" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')"
+
+  local tries=0 ids="" typed="" deleted=0
+  while [ "$tries" -lt 3 ]; do
+    r=$(tg_api getUpdates 'timeout=0' 'allowed_updates=["message"]')
+    if ! tg_ok "$r"; then
+      if printf '%s' "$r" | grep -qi 'webhook is active' && [ "$deleted" -eq 0 ]; then
+        # 只撤一次。撤了还说「webhook is active」就是别的问题，再转下去就是死循环
+        # ——一个卡住不动的部署脚本比一个报错的更难查。
+        deleted=1
+        info "这个 bot 上已经登记着一个 webhook，getUpdates 用不了。先撤掉（这次部署末尾会重新登记）"
+        tg_api deleteWebhook >/dev/null; continue
+      fi
+      die "getUpdates 失败" "Telegram 说：$(tg_desc "$r")"
+    fi
+    ids=$(printf '%s' "$r" | grep -o '"from":{"id":[0-9]\{1,\}' | sed 's/.*://' | sort -u)
+    [ -n "$ids" ] && break
+    tries=$((tries + 1))
+    echo "  在 Telegram 私聊里给这个 bot 发一条消息（随便什么内容），发完回来按回车。"
+    ask "（第 $tries 次；直接回车重试，或者自己输入数字 id）：" typed
+    [ -n "$typed" ] && break
+  done
+
+  if [ -n "$typed" ]; then TG_ALLOW=$typed
+  else
+    case "$(printf '%s\n' "$ids" | grep -c .)" in
+      0) die "认不出你的 Telegram user id" \
+             "自己查一个：给 @userinfobot 发条消息，它会回你的数字 id" \
+             "拿到之后填进 .env 的 CAIRN_TELEGRAM_ALLOW，再跑一次 $SELF --telegram" ;;
+      1) TG_ALLOW=$ids; ok "认出你的 Telegram user id：$TG_ALLOW" ;;
+      *) echo "  收到不止一个人的消息：$(printf '%s' "$ids" | tr '\n' ' ')"
+         ask "把你自己的那个填进来（逗号分隔可以填多个）：" TG_ALLOW ;;
+    esac
+  fi
+  # 只认数字，不认 @用户名：用户名能被改掉、放弃之后还能被别人注册走。
+  printf '%s' "$TG_ALLOW" | grep -qE '^[0-9]+([, ][0-9]+)*$' ||
+    die "CAIRN_TELEGRAM_ALLOW 只能是数字 id，收到的是「$TG_ALLOW」" "不认 @用户名（它能被改掉、放弃后还能被别人注册走）"
+}
+
+# 内容目录去 compose 的 volumes 段里读，不写死：compose 那一行改了的话，
+# 这里 clone 的就成了另一个目录，而容器挂的还是原来那个。
+content_dir() {
+  local rel
+  rel=$(awk '
+    /^[[:space:]]*source:[[:space:]]*/ { src = $2 }
+    /^[[:space:]]*target:[[:space:]]*\/content\/entries[[:space:]]*$/ { print src; exit }
+  ' "$COMPOSE" 2>/dev/null)
+  if [ -n "$rel" ]; then (cd "$(dirname "$COMPOSE")" && cd "$(dirname "$rel")" 2>/dev/null && printf '%s/%s' "$(pwd)" "$(basename "$rel")") && return
+  fi
+  printf '%s' "$ROOT/web/content/entries"
+}
+
+# ── 2. .env ─────────────────────────────────────────────────────────────────
+# 只做两件事：不存在就生成；存在就只**追加**缺的键。已有的行一个字都不改。
+# 为什么这么保守：CAIRN_TOKEN 是所有 ~/.cairnrc 和 CI 里配着的那个值，
+# CAIRN_TELEGRAM_SECRET 是 Telegram 那边登记着的那个值——重新生成一遍不会报错，
+# 只会让写入通道和 bot 同时静默失效，而症状（401 / bot 不回话）不指向这里。
+TZ_GUESSED=0
+sec_env() {
+  step ".env"
+  local uid gid tz
+  uid=$(id -u); gid=$(id -g)
+  # TZ 决定条目的 created 和 id 里的日期前缀（distroless 里没有 /etc/localtime，
+  # 不设就是 UTC，晚上写的东西会标成前一天）。这里要的是**写东西的人**在哪个时区，
+  # 不是机器在哪个时区——而 VPS 出厂几乎都是 UTC，照抄机器的话正好踩中上面那一脚。
+  # 所以：机器上有一个不是 UTC 的时区就用它（那多半是人自己设过的），否则退回
+  # .env.example 里那个默认值，并且说出来。
+  tz=$(cat /etc/timezone 2>/dev/null | tr -d '[:space:]')
+  case "$tz" in ""|UTC|Etc/UTC|GMT) tz=Asia/Shanghai; TZ_GUESSED=1 ;; esac
+
+  # 半配 = 服务端拒绝启动，所以这里也拒绝写出一份半配的 .env。正常路径上 tg_identify
+  # 已经把名单认出来了；走到这里还是空的说明上面某条分支漏了，宁可停下来。
+  [ -z "$TG_TOKEN" ] || [ -n "$TG_ALLOW" ] || envhas CAIRN_TELEGRAM_ALLOW || dry ||
+    die "有 bot token 却没有 allowlist，不能写出一份半配的 .env" \
+        "半配会让服务端拒绝启动，而配上 restart: unless-stopped 之后那就是一个崩溃循环"
+
+  if [ ! -f "$ENVFILE" ]; then
+    if dry; then
+      plan "生成 $ENVFILE（权限 600）：CAIRN_DOMAIN / CAIRN_URL / CAIRN_UID=$uid / CAIRN_GID=$gid / TZ=$tz"
+      plan "  CAIRN_TOKEN 和 CAIRN_TELEGRAM_SECRET 现场用 openssl rand -hex 32 生成，不回显"
+      return 0
+    fi
+    # 密钥先生成好再进子 shell。在 `echo "CAIRN_TOKEN=$(gen_secret)"` 里现生成的话，
+    # 生成失败时那一行会变成「CAIRN_TOKEN=<报错文本>」，而且没人会知道。
+    local token tgsec=""
+    token=$(gen_secret) || die "${NO_RANDOM[@]}"
+    if [ -n "$TG_TOKEN" ]; then tgsec=$(gen_secret) || die "${NO_RANDOM[@]}"; fi
+    # umask 放在子 shell 里：600 要在**文件被创建的那一刻**就是 600，
+    # 先创建再 chmod 之间有一个窗口，那个窗口里 token 是全机器可读的。
+    (
+      umask 077
+      {
+        echo "# 由 scripts/deploy 生成于 $(date '+%F %T')。手改也可以，改完跑 scripts/deploy --update。"
+        echo "# 这份文件里有两个密钥，权限是 600，且被 .gitignore 挡着。别 commit、别贴进 issue。"
+        echo
+        echo "# Caddy 给这些域名签证书（多个用空格分隔，逗号不行）。缺了容器拒绝启动。"
+        echo "CAIRN_DOMAIN=$DOMAINS"
+        echo
+        echo "# 站点地址。scripts/n 用它，服务端也用它拼 Telegram 确认里的链接。"
+        echo "CAIRN_URL=https://$DOMAIN"
+        echo
+        echo "# 写入通道的令牌（openssl rand -hex 32）。少于 32 字节服务端拒绝启动。"
+        echo "CAIRN_TOKEN=$token"
+        echo
+        echo "# 容器以哪个 uid/gid 跑。必须是内容目录的属主，否则写入一律 500。"
+        echo "CAIRN_UID=$uid"
+        echo "CAIRN_GID=$gid"
+        echo "TZ=$tz"
+        if [ -n "$TG_TOKEN" ]; then
+          echo
+          echo "# Telegram 写入通道。两个都填才开；只填一个 = 拒绝启动（半配是唯一危险的状态）。"
+          echo "CAIRN_TELEGRAM_SECRET=$tgsec"
+          echo "CAIRN_TELEGRAM_ALLOW=$TG_ALLOW"
+        fi
+      } > "$ENVFILE"
+    ) || die "写不了 $ENVFILE" "看一眼 $ROOT 的属主和权限"
+    ok "已生成 .env（权限 $(stat -c %a "$ENVFILE" 2>/dev/null || stat -f %Lp "$ENVFILE")），两个密钥现场生成、没有回显"
+    [ "$TZ_GUESSED" -eq 1 ] && info "这台机器的时区是 UTC（VPS 的出厂值），TZ 用了默认的 $tz —— 不对就改 .env 再 $SELF --update"
+  else
+    ok ".env 已经在，不覆盖（里面那个 CAIRN_TOKEN 是所有客户端配着的那个）"
+    # 缺的键补上。只追加，不改已有的行——dotenv 的语义是后来者覆盖先来者，
+    # 所以追加永远不会破坏一个已经填对的值。
+    # 用数组，不用一个空格分隔的字符串：CAIRN_DOMAIN 本身就可以是「a.example b.example」
+    # （Caddy 的多域名写法），拿空格切一遍会把它切成两个键，而 .env 里长得还挺像样。
+    local add=() kv
+    envhas CAIRN_DOMAIN || { [ -n "$DOMAINS" ] && add+=("CAIRN_DOMAIN=$DOMAINS"); }
+    envreal CAIRN_URL   || { [ -n "$DOMAIN" ] && add+=("CAIRN_URL=https://$DOMAIN"); }
+    envhas CAIRN_UID    || add+=("CAIRN_UID=$uid")
+    envhas CAIRN_GID    || add+=("CAIRN_GID=$gid")
+    envhas TZ           || add+=("TZ=$tz")
+    if [ ${#add[@]} -gt 0 ]; then
+      if dry; then plan "往 .env 追加缺的键：${add[*]%%=*}"
+      else
+        {
+          echo
+          echo "# ↓ scripts/deploy 于 $(date '+%F %T') 补上的（原有的行一个字没动）"
+          for kv in "${add[@]}"; do echo "$kv"; done
+        } >> "$ENVFILE"
+        ok "补上了缺的键：${add[*]%%=*}"
+      fi
+    fi
+    if ! envhas CAIRN_TOKEN; then
+      if dry; then plan "CAIRN_TOKEN 是空的 → 现场生成一个追加进 .env"
+      else
+        local t; t=$(gen_secret) || die "${NO_RANDOM[@]}"
+        printf 'CAIRN_TOKEN=%s\n' "$t" >> "$ENVFILE"
+        ok "CAIRN_TOKEN 是空的（空着容器会无限重启），已经生成一个补进去"
+      fi
+    fi
+    if [ -n "$TG_TOKEN" ]; then
+      # 两个键要么一起补，要么一个都不补。只追加半个进去，下一步 up 就是崩溃循环。
+      if dry; then plan "补上 Telegram 的 CAIRN_TELEGRAM_SECRET / CAIRN_TELEGRAM_ALLOW（缺哪个补哪个）"
+      else
+        local tgs=""
+        envhas CAIRN_TELEGRAM_SECRET || { tgs=$(gen_secret) || die "${NO_RANDOM[@]}"; }
+        {
+          [ -z "$tgs" ] || printf 'CAIRN_TELEGRAM_SECRET=%s\n' "$tgs"
+          envhas CAIRN_TELEGRAM_ALLOW || printf 'CAIRN_TELEGRAM_ALLOW=%s\n' "$TG_ALLOW"
+        } >> "$ENVFILE"
+        ok "Telegram 的两个变量都在 .env 里了"
+      fi
+    fi
+    if ! dry; then
+      local m; m=$(stat -c %a "$ENVFILE" 2>/dev/null || stat -f %Lp "$ENVFILE" 2>/dev/null)
+      if [ -n "$m" ] && [ "$m" != 600 ]; then chmod 600 "$ENVFILE" && ok "权限从 $m 收紧到 600（里面是密钥，同机器上别的用户不该读得到）"; fi
+    fi
+  fi
+  # 读回来核对：compose 里凡是 ${VAR:?} 的，缺一个就是「up 的那一刻拒绝启动」，
+  # 而那时候人已经在等部署完成了。在这里先拦住。
+  if ! dry; then
+    local miss="" v
+    for v in $(grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*:\?' "$COMPOSE" | sed 's/^\${//; s/:?$//' | sort -u); do
+      envhas "$v" || miss="$miss $v"
+    done
+    [ -z "$miss" ] || die "compose 要求这些变量必须有值，而 .env 里还是空的：${miss# }" "填进 $ENVFILE 再跑一次"
+    DOMAINS=$(envget CAIRN_DOMAIN); DOMAIN=${DOMAINS%% *}
+    ok "compose 的必填变量都齐了"
+  fi
+}
+
+# ── 3. 内容私有仓 ───────────────────────────────────────────────────────────
+sec_content() {
+  step "内容私有仓"
+  local dir; dir=$(content_dir)
+
+  if [ -d "$dir/.git" ]; then
+    if dry; then plan "内容仓已在 → git -C $dir pull --ff-only"; return 0; fi
+    local dirty; dirty=$(git -C "$dir" status --porcelain 2>/dev/null)
+    if [ -n "$dirty" ]; then
+      # 不 stash、不 reset。这里面是条目本身，而且很可能是刚从手机上写进来、
+      # 还没 commit 的那几条——自动丢掉它们是这条链上最不可原谅的一件事。
+      #
+      # 但要说清楚**是什么**脏了。只说「有没提交的改动」的话，一个 .DS_Store、
+      # 一个编辑器的 swap 文件、或者上一次跑到一半被 Ctrl-C 留下的自检条目，
+      # 都会让 --update 从此永远跳过 pull，而那句「多半是刚落盘的条目」
+      # 会把人往错的方向指一整天。
+      local mds nonmds
+      mds=$(printf '%s\n' "$dirty" | grep -c '\.md$' || true)
+      nonmds=$(printf '%s\n' "$dirty" | grep -vc '\.md$' || true)
+      if [ "$nonmds" -gt 0 ]; then
+        warn "内容仓里有 $nonmds 个不是 .md 的改动，跳过 pull（不动它）" \
+             "条目应该只有 .md。这多半是 .DS_Store、编辑器临时文件，或者上一次跑到一半留下的东西" \
+             "$(printf '%s\n' "$dirty" | grep -v '\.md$' | head -3 | sed 's/^/           /')" \
+             "看一眼再决定：git -C '$dir' status"
+      else
+        warn "内容仓里有 $mds 条没提交的条目，跳过 pull（不动它）" \
+             "那多半是写入通道刚落盘、还没 commit 的条目" \
+             "自己看一眼：git -C '$dir' status"
+      fi
+    elif git -C "$dir" remote | grep -q .; then
+      if git -C "$dir" pull --ff-only >/dev/null 2>&1; then ok "内容仓已更新到最新（fast-forward）"
+      else warn "git pull 没成功（网络？凭证？分叉了？）" "手动看一眼：git -C '$dir' pull"; fi
+    else
+      warn "内容仓没有 remote，只存在于这台机器上" "「服务器炸了不丢」还没成立：git -C '$dir' remote add origin <你的私有仓>"
+    fi
+  elif [ -n "$CONTENT_REPO" ]; then
+    if dry; then plan "git clone $CONTENT_REPO $dir"; return 0; fi
+    if [ -e "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+      die "$dir 已经存在而且非空，但不是 git 仓库" \
+          "里面可能是 scripts/seed 放进去的示例条目，也可能是上一次半截的部署" \
+          "确认里面没有要留的东西之后：rm -rf '$dir'，再跑一次"
+    fi
+    local created=0; [ -d "$dir" ] || created=1
+    if ! git clone "$CONTENT_REPO" "$dir"; then
+      # 半截的 clone 要删掉，但只删这个脚本自己建出来的那个目录。
+      [ "$created" -eq 1 ] && [ -d "$dir" ] && rm -rf "$dir"
+      die "clone 内容仓失败：$CONTENT_REPO" \
+          "私有仓要凭证：这台机器上配好 deploy key（ssh-keygen + 把公钥加进仓库的 Deploy keys），或者用带 token 的 https 地址" \
+          "验一下凭证通不通：git ls-remote '$CONTENT_REPO'"
+    fi
+    ok "内容仓已 clone 到 $dir"
+  else
+    if dry; then plan "内容目录不在、也没给 git 地址 → 会在本机 git init 一个（并大声说它没有 remote）"; return 0; fi
+    mkdir -p "$dir" || die "建不了 $dir"
+    git -C "$dir" init -q >/dev/null 2>&1
+    warn "没有给内容仓地址，先在本机 git init 了一个：$dir" \
+         "它没有 remote —— 「服务器炸了不丢」这一条现在**不成立**" \
+         "建好私有仓之后补上：git -C '$dir' remote add origin <地址> && git -C '$dir' push -u origin main"
+  fi
+
+  if ! dry; then
+    # 属主。这是 deploy/README 里那个「每条写入都返回 500」的根因，
+    # 而响应里只有一句 internal error，真正的原因只在容器日志里。
+    local du wu; du=$(stat -c %u "$dir" 2>/dev/null || stat -f %u "$dir"); wu=$(envget CAIRN_UID)
+    if [ "$du" != "$wu" ]; then
+      # 这里能改属主，但**先问一句**。理由：chown -R 一整个 private git 仓库是不可逆的
+      # （原来的属主信息没地方存回去），而 CAIRN_UID 可能填错——1000 在多数机器上
+      # 确实是第一个普通用户，但它也可能是**另一个真实的人**。脚本自己的取向是
+      # 「宁可停下来问」，那条取向不该在唯一一处会动别人文件的地方破例。
+      # 非交互时不猜：给出命令让人自己敲。
+      if [ "$(id -u)" -eq 0 ] || [ "$du" = "$(id -u)" ]; then
+        if confirm "把 $dir 的属主从 uid $du 改成 $wu？（chown -R，不可逆）"; then
+          chown -R "$wu:$(envget CAIRN_GID)" "$dir" 2>/dev/null &&
+            ok "属主从 uid $du 改成 $wu（容器就是以它跑的）" ||
+            die "chown 失败" "sudo chown -R $wu:$(envget CAIRN_GID) '$dir'"
+        else
+          die "内容目录属于 uid $du，而容器会以 uid $wu 跑 → 每条写入都返回 500" \
+              "要么改属主，要么把 .env 的 CAIRN_UID 改成 $du" \
+              "sudo chown -R $wu:$(envget CAIRN_GID) '$dir'"
+        fi
+      else
+        die "内容目录属于 uid $du，而容器会以 uid $wu 跑 → 每条写入都返回 500" \
+            "响应里只有一句 internal error，真正的原因（permission denied）只在容器日志里" \
+            "sudo chown -R $wu:$(envget CAIRN_GID) '$dir'"
+      fi
+    else
+      ok "属主 uid = $du，和容器要用的一致（这就是那个「每条写入 500」的根因）"
+    fi
+  fi
+}
+
+# ── 4. 换掉占位域名 ─────────────────────────────────────────────────────────
+# 现在只剩 astro.config.mjs 这一处要做文本替换：Caddyfile 已经改成读 {$CAIRN_DOMAIN}，
+# .env 是这个脚本自己写的。文本替换是整条链上最脆的一环（换过一次域名之后再跑一遍，
+# sed 要么找不到占位符、要么把真域名替换成另一个），所以这里的规矩是：
+# 只在**当前值确实是占位符**时替换，替换完立刻读回来核对，对不上就从 .bak 还原。
+astro_site() { sed -n "s/^const site = ['\"]\([^'\"]*\)['\"].*/\1/p" "$ASTROCFG" 2>/dev/null | head -1; }
+sec_domain() {
+  step "占位域名"
+  local want="https://$DOMAIN" cur; cur=$(astro_site)
+  if [ "$cur" = "$want" ]; then ok "web/astro.config.mjs 的 site 已经是 $want"; return 0; fi
+  if [ -z "$cur" ]; then
+    warn "读不出 web/astro.config.mjs 里的 site" "手动确认一眼它是 $want（canonical 用的就是它）"
+    return 0
+  fi
+  case "$cur" in
+    *example.com*) ;;
+    *) die "astro.config.mjs 的 site 是 $cur，既不是占位符也不是 $want" \
+           "不敢替换一个看着像真域名的值——两个域名不一致时站是通的，只是每一页都在把权重送给另一个" \
+           "确认要换的话自己改那一行，或者把 .env 的 CAIRN_DOMAIN 改回 $(printf '%s' "$cur" | sed 's#^https\{0,1\}://##')" ;;
+  esac
+  if dry; then plan "把 web/astro.config.mjs 的 site 从 $cur 换成 $want"; return 0; fi
+  local n; n=$(grep -c "^const site = " "$ASTROCFG")
+  [ "$n" -eq 1 ] || die "astro.config.mjs 里有 $n 行 \`const site = \`，不敢动" "手动改成 $want"
+  # -i.bak 在 GNU 和 BSD sed 上都成立；那个 .bak 就是这一步的回滚点。
+  sed -i.bak "s|^const site = ['\"][^'\"]*['\"]|const site = '$want'|" "$ASTROCFG" || die "sed 改不动 $ASTROCFG"
+  if [ "$(astro_site)" != "$want" ]; then
+    mv -f "$ASTROCFG.bak" "$ASTROCFG"
+    die "替换完读回来不是 $want，已经还原" "手动把那一行改成：const site = '$want';"
+  fi
+  rm -f "$ASTROCFG.bak"
+  ok "web/astro.config.mjs 的 site：$cur → $want（读回来核对过）"
+}
+
+# ── 5. 完整 preflight ───────────────────────────────────────────────────────
+# 到这里 .env 和内容目录都就位了，preflight 的每一条才都有意义。它只读不写
+#（唯一的例外是内容目录里一个立刻删掉的探针文件），所以 --dry-run 里照跑不误——
+# 一次「什么都不改的部署」最该告诉你的就是「真跑会卡在哪」。
+sec_preflight() {
+  step "部署前自检（scripts/preflight）"
+  [ -x "$SELF_DIR/preflight" ] || { warn "没有 scripts/preflight，跳过自检"; return 0; }
+  echo
+  "$SELF_DIR/preflight"
+  local rc=$?
+  echo
+  if [ "$rc" -eq 0 ]; then ok "自检没有致命项"; return 0; fi
+  if dry; then
+    warn "自检有 $rc 条致命项 —— 真跑的话会**停在这里**" \
+         "（dry-run 里 .env 还没生成、域名还没换、内容仓还没 clone，所以「.env 里没有 X」" \
+         " 和「还是占位域名 example.com」这两类是意料之中的，真跑时它们在这一步之前就没了）" \
+         "下面接着列出真跑时余下的步骤，只是列出来，不会做"
+    PREFLIGHT_FATALS=$rc
+    return 0
+  fi
+  echo "  $C_BAD✗$C_OFF 自检有 $rc 条致命项。每一条上面都写了怎么修。"
+  echo "      不「先试试看」是有理由的：这些错的症状和原因对不上（uid 填错 → 每条写入 500、"
+  echo "      80 被占 → 证书签不下来），先部署一遍只会让你去查错的地方。"
+  echo "      修完再跑一次 $SELF。"
+  exit 3
+}
+PREFLIGHT_FATALS=0
+
+# ── 6. 构建并发布 ───────────────────────────────────────────────────────────
+# 用 scripts/publish 而不是 npm run build：astro build 会先清空 outDir 再生成，
+# 而 outDir 就是 Caddy 的 docroot。一次失败的构建（公开目录里混进一条 private 就会
+# 失败，那正是设计要的）会把线上页面全删掉，还会留下含全部条目正文的中间 chunk。
+node_supported() { # astro 5 的 engines：^18.20.8 || ^20.3.0 || >=22
+  local M m p; IFS=. read -r M m p <<<"${1//[!0-9.]/}"; M=${M:-0}; m=${m:-0}; p=${p:-0}
+  [ "$M" -ge 22 ] && return 0
+  [ "$M" -eq 20 ] && [ "$m" -ge 3 ] && return 0
+  [ "$M" -eq 18 ] && { [ "$m" -gt 20 ] || { [ "$m" -eq 20 ] && [ "$p" -ge 8 ]; }; } && return 0
+  return 1
+}
+sec_build() {
+  step "构建并发布静态产物"
+  local use_node=0
+  have node && node_supported "$(node -p 'process.versions.node' 2>/dev/null)" && use_node=1
+
+  if dry; then
+    if [ "$use_node" -eq 1 ]; then plan "npm ci --prefix web && scripts/publish"
+    else plan "本机没有能用的 node → 用一次性容器构建：docker run --rm node:22-bookworm-slim ... scripts/publish"; fi
+    plan "验：web/dist/index.html 存在，且页面数 > 0"
+    return 0
+  fi
+
+  if [ "$use_node" -eq 1 ]; then
+    ( cd "$ROOT/web" && npm ci --no-audit --no-fund ) || die "npm ci 失败" "看上面的报错；网络不通的话先解决网络" "node 版本：$(node -v)"
+    "$SELF_DIR/publish" || die "构建失败，已发布的产物一个字节没动" \
+        "构建失败是**设计要它发生**的：公开目录里混进一条 private / circle 就会失败，并指出是哪一条" \
+        "上面那段报错里有条目 id。改掉那条的 visibility，或者把它挪出内容目录，再跑一次"
+  else
+    # 本机没有能用的 node。不去装一个 node（那又是一串各发行版各不相同的活，正是
+    # 「Caddy 搬进 compose」要消灭的那种），改用一次性容器构建完就扔。
+    # 这不违背 deploy/README 里「容器里不跑 npm」那一条：那句话反对的是**常驻**一个
+    # node 环境去伺候一天一次的构建，而这里是 docker run --rm，跑完就没了。
+    warn "本机没有能用的 node（astro 5 要 ^18.20.8 || ^20.3.0 || >=22）" "改用一次性容器构建，跑完即删"
+    docker run --rm \
+      --user "$(id -u):$(id -g)" -e HOME=/tmp -e npm_config_cache=/tmp/.npm \
+      -v "$ROOT:$ROOT" -w "$ROOT" node:22-bookworm-slim \
+      bash -c 'npm ci --prefix web --no-audit --no-fund && scripts/publish' ||
+      die "容器里构建失败" "同上：构建失败可能正是设计要的（公开目录里混进了 private 条目）" \
+          "本机装一个 node 会更好查错：https://github.com/nodesource/distributions"
+  fi
+  [ -f "$ROOT/web/dist/index.html" ] || die "构建报告成功，但 web/dist 里没有首页" "不敢让 Caddy 指着一个空目录发站"
+  ok "已发布 $(find "$ROOT/web/dist" -name '*.html' | wc -l | tr -d ' ') 个页面 → web/dist"
+}
+
+# ── 7. 起容器 ───────────────────────────────────────────────────────────────
+wait_healthy() { # wait_healthy <服务名> <秒>
+  local svc=$1 limit=${2:-180} cid state waited=0 restarts=0
+  # -a：已经退出的也要列出来。只用 ps -q 的话，启动即崩的容器查不到，
+  # 于是「崩溃循环」会被报成「容器根本没建出来」——又一个症状和原因对不上。
+  cid=$(dc ps -aq "$svc" 2>/dev/null | head -1)
+  [ -n "$cid" ] || die "$svc 的容器根本没建出来" "docker compose --env-file .env -f deploy/docker-compose.yml ps -a"
+  while :; do
+    state=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null)
+    [ "$waited" -gt 0 ] && [ "$state" != starting ] && echo
+    case "$state" in
+      healthy) ok "$svc 健康（等了 ${waited}s）"; return 0 ;;
+      running) ok "$svc 在跑（这个服务没定义 healthcheck）"; return 0 ;;
+      starting) : ;;
+      restarting)
+        restarts=$((restarts + 1))
+        # 崩溃循环。restart: unless-stopped + 配置不合法 = 无限重启，
+        # 而 deploy/README 的「容易踩的几脚」里三条都长这样（token 空、Telegram 半配、
+        # uid 填错）。日志第一行就会直说，所以别等满 180 秒。
+        [ "$restarts" -ge 3 ] && { show_logs "$svc"; die "$svc 在无限重启" \
+            "十有八九是 .env 里某个值不合法——服务拒绝在配置不全的情况下启动，配上 restart: unless-stopped 就是崩溃循环" \
+            "上面那段日志的第一行会直说是哪一个"; } ;;
+      unhealthy|exited|dead)
+        show_logs "$svc"; die "$svc 是 $state" "上面那段日志是唯一的线索（容器没被停掉，随时可以再看：docker compose --env-file .env -f deploy/docker-compose.yml logs $svc）" ;;
+    esac
+    [ "$waited" -ge "$limit" ] && { show_logs "$svc"; die "$svc 等了 ${limit}s 还没健康（现在是 $state）"; }
+    sleep 3; waited=$((waited + 3))
+    printf '.'; [ $((waited % 60)) -eq 0 ] && printf ' %ss\n' "$waited"
+  done
+}
+show_logs() {
+  echo
+  echo "  ── docker compose logs --tail 40 $1 ──"
+  dc logs --tail 40 --no-color "$1" 2>&1 | sed 's/^/      /'
+  echo
+}
+sec_up() {
+  step "起容器"
+  if dry; then
+    plan "docker compose --env-file .env -f deploy/docker-compose.yml up -d --build --remove-orphans"
+    plan "等 server 和 caddy 的 healthcheck 变绿（超时 180s；出现崩溃循环就立刻停下并打日志）"
+    return 0
+  fi
+  dc up -d --build --remove-orphans || die "docker compose up 失败" \
+      "compose 的报错就在上面。常见两类：" \
+      "  bind source path does not exist —— 某个挂载的宿主机目录不在（compose 里故意关掉了自动建目录）" \
+      "  address already in use —— 80 / 443 被别的东西占着（sudo ss -lntp | grep :80）"
+  ok "compose up 返回 0 —— 但那只说明容器创建了，不说明它没在崩溃循环，接着等 healthcheck"
+  wait_healthy server 180
+  wait_healthy caddy 180
+}
+
+# ── 8. 逐个端点验活 ─────────────────────────────────────────────────────────
+# 「命令返回 0」不算数。这一节把 deploy/README 里那几脚全部变成断言。
+CURL_BASE=()
+CURL_CFG=""     # 一行一条 curl 配置项，用来放密钥——写在命令行上的密钥，
+                # 同机器上任何一个用户 ps auxww 都看得见
+CODE=""; BODYFILE=""
+hit() { # hit <路径> [额外的 curl 参数...]；结果放进 CODE，正文放进 $BODYFILE
+  local p=$1; shift
+  BODYFILE="$TMPD/body"
+  local rc
+  if [ -n "$CURL_CFG" ]; then
+    # 配置从**管道**进，不是文件、也不是 heredoc（bash 的 heredoc 会在 $TMPDIR 里
+    # 落一个临时文件，密钥就上了磁盘）。--config 里只放 header，URL 仍走位置参数，
+    # 免得 curl 把配置里的 url 和位置参数当成两次请求。
+    CODE=$(printf '%s\n' "$CURL_CFG" | curl "${CURL_BASE[@]}" --config - -o "$BODYFILE" -w '%{http_code}' "$@" "https://$DOMAIN$p" 2>"$TMPD/err")
+    rc=$?
+  else
+    CODE=$(curl "${CURL_BASE[@]}" -o "$BODYFILE" -w '%{http_code}' "$@" "https://$DOMAIN$p" 2>"$TMPD/err")
+    rc=$?
+  fi
+  CURL_CFG=""   # 用完就清。忘了清的话，下一次请求会把上一次的密钥一起带出去
+  return $rc
+}
+expect() { # expect <路径> <期望状态码> <这条断言在说什么>
+  local p=$1 want=$2 what=$3
+  if hit "$p" && [ "$CODE" = "$want" ]; then ok "$what（$p → $CODE）"; return 0; fi
+  bad_hit "$p" "$want" "$what"
+}
+bad_hit() {
+  local p=$1 want=$2 what=$3
+  die "$what —— 期望 $p 返回 $want，实际是 ${CODE:-连不上}" "$(sed -n 1p "$TMPD/err" 2>/dev/null)"
+}
+
+sec_verify() {
+  step "逐个端点验活"
+  if dry; then
+    plan "docker compose exec caddy ls -A /srv/cairn/web/content → 必须是空的（条目不该在那个容器里存在）"
+    plan "GET https://<域名>/            → 200，且真的走了 HTTPS"
+    plan "GET https://<域名>/feed.xml    → 200"
+    plan "GET https://<域名>/u/<随机>/   → 404，且正文不是 0 字节（0 字节 = Caddy 自带的空白页，说明 handle_errors 没了）"
+    plan "GET https://<域名>/circle/x    → 501（还没实现的东西必须拒绝，不能放行）"
+    plan "POST /api/write 不带 token     → 401"
+    plan "POST /api/write 带 token       → 201，落盘，读回来核对，再把那条删掉"
+    return 0
+  fi
+
+  # ① 内容目录不在 Caddy 那个容器里。compose 用一层空 tmpfs 盖住 web/content，
+  #    因为「Caddyfile 的 root 指向 dist 所以发不出去」和「根本不在这个容器里」是两回事：
+  #    前者依赖一行配置一直是对的。这是 ARCHITECTURE 第 2 节那句「字节必须由服务端
+  #    决定发不发」在部署层的同一条推论，所以它排在所有断言的最前面。
+  #    命令本身失败（容器没起来、exec 用不了）时**不能**当成通过：一条安全断言
+  #    最坏的形态就是「没跑起来，但报了绿灯」。所以让命令自己把 rc 打回来，
+  #    收不到那个标记就说明这条断言根本没执行到。
+  local leak; leak=$(dc exec -T caddy sh -c 'ls -A /srv/cairn/web/content; echo "__rc=$?"' 2>&1)
+  case "$leak" in
+    *__rc=*) ;;
+    *) die "验不了「Caddy 容器里看不见内容目录」这条断言（exec 没跑起来）" \
+           "宁可停下来也不报一个没验过的绿灯" \
+           "docker 说：$(printf '%s' "$leak" | tr '\n' ' ' | cut -c1-200)" ;;
+  esac
+  local files; files=$(printf '%s\n' "$leak" | grep -v '^__rc=')
+  if [ -n "$files" ]; then
+    die "Caddy 容器里能看见内容目录：$(printf '%s' "$files" | tr '\n' ' ')" \
+        "那里面是四层可见度混在一起的真实条目，包括 private——它们不该在那个进程眼里存在" \
+        "compose 里 caddy 的 volumes 段应该有一条 type: tmpfs、target: /srv/cairn/web/content，检查它还在不在"
+  fi
+  if printf '%s' "$leak" | grep -q '__rc=0'; then ok "Caddy 容器里 /srv/cairn/web/content 是空的（那层 tmpfs 生效了）"
+  else ok "Caddy 容器里根本没有 /srv/cairn/web/content 这个路径（更彻底，也算通过）"; fi
+
+  # ② 首页。证书要现签，慢的时候几十秒，所以带重试。
+  CURL_BASE=(--silent --show-error --max-time 20)
+  case "$DOMAIN" in
+    localhost|127.0.0.1|*.localhost)
+      # 演练部署：Caddy 用内置 CA 签，那个根证书不在系统信任库里。跳过校验只是
+      # 跳过「这张证书可信吗」，「有没有走 TLS」仍然验得到。
+      CURL_BASE+=(--insecure); info "演练域名 $DOMAIN：证书是 Caddy 内置 CA 签的，curl 用 --insecure" ;;
+  esac
+  local waited=0 limit=180
+  while :; do
+    hit / && [ "$CODE" = 200 ] && break
+    if [ "$waited" -ge "$limit" ]; then
+      # 从这里开始区分三种长得一样的失败。curl 的退出码就在 $TMPD/err 里那句话上。
+      local err; err=$(sed -n 1p "$TMPD/err" 2>/dev/null)
+      # 再从回环试一次：能通就说明 Caddy 是好的，断在公网这一段（防火墙 / 安全组 / DNS）。
+      local local_code
+      local_code=$(curl "${CURL_BASE[@]}" --resolve "$DOMAIN:443:127.0.0.1" -o /dev/null -w '%{http_code}' "https://$DOMAIN/" 2>/dev/null)
+      if [ "$local_code" = 200 ]; then
+        die "从公网地址访问不到，但 --resolve 到本机 127.0.0.1 是 200 —— Caddy 和证书都是好的" \
+            "断在这台机器之外：云厂商的安全组 / 防火墙没放行 80 和 443，或者 A 记录还没指过来（也可能只是还没生效）" \
+            "云上最常见的是安全组。ufw 的话：sudo ufw allow 80,443/tcp" \
+            "curl 说：$err"
+      fi
+      die "首页拿不到 200（现在是 ${CODE:-连不上}），等了 ${limit}s" \
+          "证书签不下来最常见的两个原因：A 记录没指到这台机器；80 端口被别的东西占着（ACME 的挑战走 80）" \
+          "看 Caddy 在做什么：docker compose --env-file .env -f deploy/docker-compose.yml logs --tail 50 caddy" \
+          "curl 说：$err"
+    fi
+    [ "$waited" -eq 0 ] && printf '  等证书和首页'
+    sleep 5; waited=$((waited + 5)); printf '.'
+  done
+  [ "$waited" -gt 0 ] && echo
+  # curl 的 %{scheme} 在不少版本上回的是大写的 HTTPS（实测 8.5 就是），
+  # 直接和小写比会得到一句「是 200，但走的不是 https（HTTPS）」——自己制造一个
+  # 症状和原因对不上的故障。压成小写再比。
+  local scheme; scheme=$(curl "${CURL_BASE[@]}" -o /dev/null -w '%{scheme}' "https://$DOMAIN/" 2>/dev/null | tr 'A-Z' 'a-z')
+  [ "$scheme" = https ] || die "首页是 200，但走的不是 https（$scheme）"
+  ok "首页 200，走的是 HTTPS（等了 ${waited}s）"
+
+  # ③ feed。
+  expect /feed.xml 200 "feed 发得出来"
+
+  # ④ 猜不到的 unlisted 路径必须得到明确的否定，而且发的得是自己那张 404 页。
+  #    这一条不是「404 页好不好看」：unlisted 的全部防护就是猜不到，所以「猜错」
+  #    必须得到一个明确的否定（deploy/README 里那条 soft 404 的理由）。
+  #    状态码之外还量一眼正文长度，因为**删掉整段 handle_errors 时状态码仍然是 404**
+  #    （实测如此：Caddy 自带的那个 404 是 0 字节的空白页），只看状态码这条断言
+  #    就抓不到「站上没有 404 页」——而那正是 deploy/README 记着的那一脚。
+  local guess; guess=$(gen_secret) || guess=0123456789abcdef0123456789abcdef
+  hit "/u/$guess/"
+  local n404; n404=$(wc -c <"$BODYFILE" 2>/dev/null | tr -d ' ')
+  [ "$CODE" = 404 ] || bad_hit "/u/<随机>/" 404 "猜错的 unlisted 路径必须得到明确的否定"
+  [ "${n404:-0}" -gt 0 ] || die "猜错的 unlisted 路径回了 404，但正文是 0 字节 —— 那是 Caddy 自带的空白页" \
+      "web/src/pages/404.astro 构建出来的那一页没发出去，多半是 Caddyfile 里 handle_errors 那段被删了" \
+      "file_server 找不到文件时**不会**自己去用同目录下的 404.html，得靠 handle_errors"
+  ok "猜错的 unlisted 路径 → 404，而且发的是自己那张 404 页（$n404 字节，不是空白页）"
+
+  # ⑤ 还没实现的东西必须拒绝请求。
+  expect /circle/x 501 "/circle/* 仍然一律 501（没实现的东西不放行）"
+
+  # ⑥ 写入通道：先证明门是关着的。
+  CURL_CFG='header = "Authorization: Bearer 这不是一个有效的 token"'
+  hit /api/write -X POST -H 'Content-Type: application/json' --data '{"text":"x"}'
+  [ "$CODE" = 401 ] || bad_hit /api/write 401 "错 token 必须被拒"
+  ok "错 token 打 /api/write → 401（门是关着的）"
+
+  # ⑦ 再证明它对真 token 是通的：写一条 private，读回来核对，然后删掉。
+  #    写 private 而不是 public：private 根本不进静态构建产物，就算这里出岔子、
+  #    没删干净，它也不会出现在站上。
+  local token; token=$(envget CAIRN_TOKEN)
+  CURL_CFG="header = \"Authorization: Bearer $token\""
+  hit /api/write -X POST -H 'Content-Type: application/json' \
+      --data '{"text":"scripts/deploy 的写入通道自检，随后会被删掉。","type":"log","visibility":"private"}'
+  local body id dir
+  body=$(cat "$BODYFILE" 2>/dev/null)
+  if [ "$CODE" != 201 ]; then
+    if [ "$CODE" = 500 ]; then
+      die "写入通道返回 500" \
+          "响应里只有一句 internal error，真正的原因（多半是 permission denied）只在容器日志里" \
+          "内容目录的属主得和 .env 里的 CAIRN_UID 一致：ls -ldn '$(content_dir)'" \
+          "docker compose --env-file .env -f deploy/docker-compose.yml logs --tail 20 server"
+    fi
+    die "写入通道没通（$CODE）" "服务端说：$(printf '%s' "$body" | tr '\n' ' ' | cut -c1-200)"
+  fi
+  id=$(printf '%s' "$body" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  [ -n "$id" ] || die "写入返回 201，但响应里读不出 id" "响应：$(printf '%s' "$body" | cut -c1-200)"
+  dir=$(content_dir)
+  [ -f "$dir/$id.md" ] || die "写入返回 201，但宿主机上没有 $dir/$id.md" \
+      "容器写进去的地方和宿主机上这个目录不是同一个 —— compose 里 /content/entries 那条挂载对不上"
+  rm -f "$dir/$id.md" || die "删不掉刚才那条自检条目 $dir/$id.md" "手动删一下"
+  [ -f "$dir/$id.md" ] && die "自检条目没删掉：$dir/$id.md"
+  ok "写入通道通了：201 → 落盘 → 读回来核对 → 那条已删掉（写的是 private，本来也不会上站）"
+}
+
+# ── 9. Telegram ─────────────────────────────────────────────────────────────
+# bot token 只在这一节用，用完就随进程一起没了。curl 的配置从管道进：
+# 写在 URL 里的 token 会进 ps、进 shell 历史、进任何一个抓命令行的监控。
+tg_esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+tg_api() { # tg_api <方法> [key=value ...] → 正文打到 stdout
+  local method=$1; shift
+  local cfg; cfg=$(printf 'url = "https://api.telegram.org/bot%s/%s"\nsilent\nshow-error\nmax-time = "20"' "$(tg_esc "$TG_TOKEN")" "$method")
+  local d
+  for d in "$@"; do cfg="$cfg"$'\n'"data-urlencode = \"$(tg_esc "$d")\""; done
+  printf '%s\n' "$cfg" | curl --config -
+}
+tg_ok() { printf '%s' "$1" | grep -q '"ok":true'; }
+tg_desc() { printf '%s' "$1" | sed -n 's/.*"description":"\([^"]*\)".*/\1/p'; }
+
+sec_telegram() {
+  local sec; sec=$(envget CAIRN_TELEGRAM_SECRET)
+  # dry-run 里没有 token（这一步不问），但计划还是要列出来——
+  # 「dry-run 说什么都不做，真跑却多做了一件事」比不列更坏。
+  if dry; then
+    step "Telegram"
+    plan "给了 bot token 的话：getMe 验一遍 → getUpdates 认出你的数字 user id → 写进 .env"
+    plan "setWebhook：url=https://<域名>/api/telegram，secret_token=<.env 里那个>，allowed_updates=[\"message\"]，drop_pending_updates=true"
+    plan "getWebhookInfo：核对 url、pending_update_count、last_error_message"
+    plan "没给 token = 不开这条通道，两个变量都空着，/api/telegram 连路由都不注册（404）"
+    return 0
+  fi
+  if [ -z "$TG_TOKEN" ]; then
+    if [ -n "$sec" ]; then
+      step "Telegram"
+      info ".env 里有 secret，说明这条通道之前就配好了 —— 没改 secret 就不用重新 setWebhook"
+      warn "改过 secret 的话必须重新登记，否则 bot 一条也不回，而且不报错" \
+           "Telegram 那边还带着旧 secret，服务端一律 403；getWebhookInfo 的 last_error_message 会写着 403 Forbidden" \
+           "重新登记：$SELF --telegram"
+    fi
+    return 0
+  fi
+  step "Telegram"
+  [ -n "$sec" ] || die "要配 Telegram，但 .env 里没有 CAIRN_TELEGRAM_SECRET" "删掉 .env 里 Telegram 那两行重跑，或者手动补上一个 openssl rand -hex 32"
+  envhas CAIRN_TELEGRAM_ALLOW || die "要配 Telegram，但 .env 里没有 CAIRN_TELEGRAM_ALLOW" "填数字 user id 进去（给 @userinfobot 发条消息能拿到），再跑一次 $SELF --telegram"
+
+  # 演练部署（localhost）上 setWebhook 一定失败，而失败信息是 Telegram 那边的
+  # 「Failed to resolve host」，看着像网络问题。先在这里说清楚。
+  case "$DOMAIN" in
+    localhost|127.0.0.1|*.localhost)
+      warn "域名是 $DOMAIN，Telegram 够不到这台机器，跳过 setWebhook" \
+           "webhook 要求公网可达 + 公开可信的证书（内置 CA 签的那张它不认）" \
+           "换成真域名重跑之后再登记：$SELF --telegram"
+      return 0 ;;
+  esac
+
+  local r
+  # 名单是**启动时**读的。刚补进 .env 的话得让容器重新拿一遍，否则 bot 会把你自己拒了
+  # ——而那条拒绝只写在容器日志里，手机上什么反应都没有。
+  # compose 把 env_file 的内容算进配置哈希，所以内容没变时这条 up 什么也不会做（幂等）。
+  dc up -d server >/dev/null 2>&1 || die "重启 server 让 .env 生效失败" \
+      "docker compose --env-file .env -f deploy/docker-compose.yml up -d server"
+  wait_healthy server 120
+
+  # allowed_updates 和 drop_pending_updates 都不是礼节：不限定的话 edited_message、
+  # my_chat_member 之类会一起推过来，每条都要走一遍鉴权和去重；不丢历史消息的话，
+  # 你在配 webhook 之前发给 bot 的东西会在登记那一刻全部涌进来变成条目。
+  r=$(tg_api setWebhook "url=https://$DOMAIN/api/telegram" "secret_token=$sec" 'allowed_updates=["message"]' 'drop_pending_updates=true')
+  tg_ok "$r" || die "setWebhook 失败" "Telegram 说：$(tg_desc "$r")" \
+      "Telegram 只往 443 / 80 / 88 / 8443 推，且证书必须是公开可信的——演练用的 localhost 证书它不认"
+  ok "webhook 已登记：https://$DOMAIN/api/telegram"
+
+  # 验一遍。deploy/README 写了这一步该看什么：pending_update_count 一直涨、
+  # last_error_message 有话说，就是没通。
+  r=$(tg_api getWebhookInfo)
+  tg_ok "$r" || die "getWebhookInfo 失败" "Telegram 说：$(tg_desc "$r")"
+  local url pending lasterr
+  url=$(printf '%s' "$r" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')
+  pending=$(printf '%s' "$r" | sed -n 's/.*"pending_update_count":\([0-9]*\).*/\1/p')
+  lasterr=$(printf '%s' "$r" | sed -n 's/.*"last_error_message":"\([^"]*\)".*/\1/p')
+  [ "$url" = "https://$DOMAIN/api/telegram" ] || die "getWebhookInfo 里的 url 是「$url」，不是 https://$DOMAIN/api/telegram"
+  if [ -n "$lasterr" ]; then
+    warn "last_error_message：$lasterr" \
+         "403 Forbidden = secret 对不上（改了 secret 忘了重新 setWebhook 就是这个症状）" \
+         "刚刚才登记的话，这条可能是上一次登记留下的旧记录，给 bot 发条消息再看一眼：" \
+         "  然后 curl 一下 getWebhookInfo（token 自己带）"
+  fi
+  ok "getWebhookInfo：url 对得上，pending_update_count=${pending:-0}${lasterr:+，但有 last_error_message（见上）}"
+  info "最后一步只有你能做：给 bot 发一条消息，看它回不回。脚本发不了——发消息的是你，不是 bot"
+}
+
+# ── 代码仓自己的更新（只在 --update）───────────────────────────────────────
+update_code() {
+  step "拉代码"
+  if dry; then plan "git -C $ROOT pull --ff-only（拉到新版本的话，会把新的 scripts/deploy exec 起来接着跑）"; return 0; fi
+  if ! git -C "$ROOT" remote | grep -q .; then info "代码仓没有 remote，跳过拉取"; return 0; fi
+  if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
+    warn "代码仓里有没提交的改动，跳过 pull（不动它）" "看一眼：git -C '$ROOT' status"
+    return 0
+  fi
+  local before after
+  before=$(cksum < "$SELF" 2>/dev/null)
+  git -C "$ROOT" pull --ff-only || { warn "git pull 没成功，用当前这份代码接着部署" "手动看一眼：git -C '$ROOT' pull"; return 0; }
+  after=$(cksum < "$SELF" 2>/dev/null)
+  ok "代码已更新到 $(git -C "$ROOT" rev-parse --short HEAD)"
+  if [ "$before" != "$after" ]; then
+    # 这个脚本把自己拉新了。bash 是**边读边执行**的，接着往下跑读到的会是新文件的
+    # 字节偏移，行为无法预测——所以立刻把新的自己起起来，并告诉它别再拉一次。
+    info "scripts/deploy 自己也更新了，换成新版本接着跑"
+    # exec 会替换掉这个进程，EXIT 的 trap 不会跑，所以临时目录得在这里自己收。
+    cleanup; TMPD=""
+    exec "$SELF_DIR/deploy" --update --no-pull
+  fi
+}
+
+# ── 摘要 ────────────────────────────────────────────────────────────────────
+sec_summary() {
+  local url="https://$DOMAIN"
+  printf '\n%s部署完成。%s\n\n' "$C_OK$C_B" "$C_OFF"
+  echo "  站点      $url"
+  echo "  feed      $url/feed.xml"
+  echo "  健康      docker compose --env-file .env -f deploy/docker-compose.yml ps"
+  echo
+  echo "  写入通道（在**你自己的电脑**上，写进 ~/.cairnrc 并 chmod 600）："
+  echo "      export CAIRN_URL=$url"
+  echo "      export CAIRN_TOKEN=…       ← 已写入服务器上的 .env，这里不打印全文"
+  echo "      取出来：ssh <这台机器> \"grep '^CAIRN_TOKEN=' $ENVFILE | cut -d= -f2-\""
+  echo "      然后：scripts/n \"刚想到的一件事\"      # 默认 log + private"
+  echo
+  if envhas CAIRN_TELEGRAM_SECRET && envhas CAIRN_TELEGRAM_ALLOW; then
+    echo "  Telegram  已登记 webhook。给 bot 发一条消息试试；发 /help 会把指令词回给你一遍"
+    echo "            （群里的消息不会被记也不会有回应，那是有意的：确认里可能带着 unlisted 的链接）"
+  else
+    echo "  Telegram  没开（两个变量都空 = 路由根本不注册，/api/telegram 返回 404）"
+    echo "            想开：找 @BotFather 拿 token，然后跑 $SELF_DIR/deploy --telegram"
+  fi
+  echo
+  # 摘要里用绝对路径，不用 $SELF：这几行是要被复制粘贴的，而人下次是在别的目录里敲它。
+  echo "  下次更新   $SELF_DIR/deploy --update"
+  echo "            （拉代码、拉内容、重新构建发布、重启容器，再把上面那些端点重验一遍）"
+  echo "  只发内容   scripts/publish"
+  echo "            写完一条 public 条目之后没有任何东西会自动重建 —— 这是目前最刺眼的一处不对称"
+  echo
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+main() {
+  printf '%scairn 部署%s（%s）' "$C_B" "$C_OFF" "$ROOT"
+  [ "$MODE" = update ] && printf ' · 更新'
+  dry && printf ' · %sdry-run：一个字节都不会改%s' "$C_WARN" "$C_OFF"
+  echo
+
+  if [ "$MODE" = update ]; then
+    [ -f "$ENVFILE" ] || dry || die "没有 .env，这台机器上还没部署过" "先跑一次不带 --update 的 $SELF"
+    DOMAINS=$(envget CAIRN_DOMAIN); DOMAIN=${DOMAINS%% *}
+    [ "$DO_PULL" -eq 1 ] && update_code
+    sec_tools
+    sec_content
+    sec_preflight
+    sec_build
+    sec_up
+    sec_verify
+    if [ "$WANT_TG" = force ]; then
+      sec_ask       # 只会问 bot token：域名和内容仓这时候都已经就位了
+      sec_env       # 把 Telegram 那两个键补进 .env（只追加，别的行不动）
+      sec_telegram  # 它自己会 up -d server 让新 .env 生效，再 setWebhook
+    fi
+  else
+    sec_tools
+    sec_ask
+    sec_env
+    sec_content
+    sec_domain
+    sec_preflight
+    sec_build
+    sec_up
+    sec_verify
+    [ "$WANT_TG" != never ] && sec_telegram
+  fi
+
+  if dry; then
+    printf '\n%s以上是 dry-run：什么都没做。%s\n' "$C_WARN" "$C_OFF"
+    if [ "$PREFLIGHT_FATALS" -gt 0 ]; then
+      echo "  自检有 $PREFLIGHT_FATALS 条致命项，真跑会停在自检那一步。"
+      # 退非零，因为 `scripts/deploy --dry-run && scripts/deploy` 这种写法很自然，
+      # 而 dry-run 说「行」而真跑立刻停，就是一句谎话。
+      exit 3
+    fi
+    if [ "$MODE" = update ]; then echo "  真跑一遍：$SELF --update"; else echo "  真跑一遍：$SELF"; fi
+    exit 0
+  fi
+  sec_summary
+}
+main

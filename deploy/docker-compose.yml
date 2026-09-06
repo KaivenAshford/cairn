@@ -1,8 +1,105 @@
-# cairn 部署。静态产物由本机 `scripts/publish` 生成，Caddy 直接从磁盘发；
-# 容器里只跑那个必须常驻的进程——Go 写入服务。部署形态见 deploy/README.md。
+# cairn 部署：一台机器、两个容器，服务器上除了 Docker 什么都不用装。
+#
+# 从前 Caddy 是宿主机原生装的（apt + systemd），理由是「静态产物是文件，让 Caddy 直接从
+# 磁盘发就行，多套一个容器换不来好处」。那个判断在目标变成**一键部署**之后不再成立：
+# 好处不在运行时，在安装那一步——Caddy 进了 compose，新机器上要人做的事就只剩
+# 「装 Docker」，不再有 apt 源、systemd unit、/etc/caddy 属主这一串各发行版各不相同的活。
+# 代价（多一个容器、多几处 volume 映射）是一次性的，写在这个文件里；
+# 而那串活是每台新机器都要重来一遍的。
+#
+# 完整步骤见 deploy/README.md。
 name: cairn
 
 services:
+  # ── 边缘：TLS、静态产物、反代 ──────────────────────────────────────────────
+  caddy:
+    # 钉住大版本而不是 latest：Caddy 3 出来时不该由一次 `docker compose pull` 决定升级。
+    image: caddy:2-alpine
+    restart: unless-stopped
+    # Caddy 不设 user，和下面的 server 不一样，这是有意的：
+    #   1. 它要在容器内 bind 80/443，非 root 用户没有 NET_BIND_SERVICE 就直接起不来；
+    #   2. server 之所以要设 uid，是因为它往一个**宿主机目录**里写文件，uid 对不上就写不进去；
+    #      Caddy 只读那个目录（:ro），而它要写的 /data、/config 是 Docker 自己建的具名卷，
+    #      属主天然对得上。没有要解决的属主问题，就别引入一个新的失败点。
+    environment:
+      # 域名不写死在 Caddyfile 里，从这里传进去（Caddyfile 用 {$CAIRN_DOMAIN} 读）。
+      # `:?` 是要它在缺失时**拒绝启动**：与其猜一个域名去签证书，不如停下来问。
+      # 注意 compose 的变量替换读的是**项目目录**下的 .env，而项目目录默认是这个 compose
+      # 文件所在的 deploy/，不是仓库根。所以必须显式指路：
+      #   docker compose --env-file .env -f deploy/docker-compose.yml up -d
+      # 少了 --env-file 的症状：这一行直接报「CAIRN_DOMAIN 没配」——这是好事，
+      # 从前 ${CAIRN_UID:-1000} 那种带默认值的写法在同样情况下会静默用错的 uid。
+      CAIRN_DOMAIN: ${CAIRN_DOMAIN:?没配 CAIRN_DOMAIN。填进仓库根的 .env，并用 docker compose --env-file .env -f deploy/docker-compose.yml 启动}
+    ports:
+      # 80 不是可选的：ACME 的 HTTP-01 挑战走它，HTTP→HTTPS 跳转也走它。
+      - "80:80"
+      - "443:443"
+      # HTTP/3。Caddy 默认就在 443/udp 上开 h3 并在响应里广告 Alt-Svc；
+      # 只映射 TCP 的话，浏览器会照着广告去连一个通不了的 UDP 端口，
+      # 失败后才退回 TCP——症状是「偶尔要卡一下才出页面」，没人会想到是少映射了一行。
+      - "443:443/udp"
+    volumes:
+      # 所有 bind mount 都写长格式并关掉 create_host_path。默认值是 true——路径不存在时
+      # dockerd 会**以 root 建一个空目录**顶上，于是缺文件变成「起来了但不对」：
+      # Caddyfile 缺了会挂载成一个空目录（Caddy 报 is a directory），
+      # dist 缺了是整站 404。关掉之后，缺什么就在 up 那一刻直说「bind source path does not exist」。
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
+      # 静态产物。挂的是 web/ 这一层而不是 web/dist，**这一条不能改回去**：
+      # scripts/publish 是用 rename 换产物的（build 到 dist.next，成功了才 mv 成 dist），
+      # 而 bind mount 在容器启动那一刻绑定的是**那个 inode**，不是那个路径。
+      # 直接挂 web/dist 的话，publish 之后容器里仍然是被换掉的旧目录，
+      # 而且旧目录随后会被 rm 掉——症状是「发布成功了，线上就是不更新」，
+      # 重启容器又好了，最像玄学的一类故障。挂父目录，dist 的查找就发生在每次请求时。
+      # 顺带解决另一件事：web/ 跟着代码仓一起来，一定存在；而 web/dist 在第一次构建前
+      # 不存在，挂它就要求「必须先构建再起容器」这么一条隐式顺序——挂父目录就没这条约束，
+      # 先起容器也只是暂时全站 404（实测如此，Caddy 不会崩），构建完下一个请求就好了。
+      - type: bind
+        source: ../web
+        target: /srv/cairn/web
+        read_only: true
+        bind:
+          create_host_path: false
+      # 但 web/ 底下有 content/——那是另一个 private 仓库，四层可见度的条目都在里面。
+      # 用一个空 tmpfs 盖住它。Caddy 的 root 指向 dist，本来就发不出这些文件，
+      # 但「发不出去」和「根本不在这个容器里」是两回事：前者依赖 Caddyfile 一直是对的。
+      # 断言（部署脚本里跑）：docker compose exec caddy ls -A /srv/cairn/web/content
+      #   → 必须是空的。能列出 entries/ 就说明这层遮蔽没生效。
+      - type: tmpfs
+        target: /srv/cairn/web/content
+        tmpfs:
+          size: 4096
+      # 证书必须持久化。不持久化的话每次 `docker compose down`＋`up` 都是一次全新签发，
+      # 而 Let's Encrypt 对「同一组域名的重复证书」是每周 5 张——试几次就被锁到下周，
+      # 期间新证书一张也签不出来。症状是「网站打不开 / 证书错误」，
+      # 谁也不会把它和三天前多重建了几次容器联系起来。所以：
+      #   - 这两个卷不要删，`docker compose down -v` 的 -v 会连它们一起清掉；
+      #   - 要反复演练部署，把 CAIRN_DOMAIN 设成 localhost，Caddy 会用内置 CA 签，
+      #     完全不碰 ACME，也就不消耗任何配额。
+      - caddy_data:/data      # 证书、账户密钥、OCSP 缓存
+      - caddy_config:/config  # 上次生效的配置快照
+    depends_on:
+      server:
+        # 只等「启动了」，不等「健康」。用 service_healthy 会把静态站的可用性绑在
+        # Go 服务的健康上：CAIRN_TOKEN 忘填时 server 崩溃循环、永远不健康，
+        # 于是 Caddy 永远不启动，一个写入通道的配置错误升级成整站 502。
+        # 反过来才是对的——server 挂着的时候，站照发，只有 /api/* 回 502。
+        condition: service_started
+    healthcheck:
+      # 探 Caddy 自己的 admin API（只在容器内的回环上，没有对外映射）。
+      # 它只证明「进程活着、配置加载了」。**不**证明证书签下来了、DNS 指对了、
+      # 公网能连上——那三件事绿灯了也可能是坏的，得用真域名 curl 一次才算数。
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  # ── 写入通道 ────────────────────────────────────────────────────────────
   server:
     build:
       context: ..
@@ -17,9 +114,14 @@ services:
     # 属于 clone 仓库的那个用户。uid 对不上的话，写入通道对每一条记录都返回 500
     # ——日志里是 permission denied，响应里只有一句 internal error。
     # 所以按宿主机上的属主来跑。取值：`id -u` / `id -g`，填进 .env。
-    user: "${CAIRN_UID:-1000}:${CAIRN_GID:-1000}"
+    # 这里也用 `:?` 而不是 `:-1000`：1000 是个「看着很对」的默认值，恰好也是猜错时
+    # 最难查的那种错——宁可停下来问。
+    user: "${CAIRN_UID:?没配 CAIRN_UID。填 `id -u` 的值进 .env，并记得 --env-file .env}:${CAIRN_GID:?没配 CAIRN_GID。填 `id -g` 的值进 .env}"
     environment:
       # 容器内固定路径；宿主机的实际位置由下面的 volumes 决定。
+      # 0.0.0.0 是必须的：现在这个端口只在 compose 网络里对 caddy 开放，
+      # 绑回环的话 Caddy 一条也连不进来，而容器 running、healthcheck 还是绿的
+      # （探活也在容器内），只有 /api/* 全线 502。
       CAIRN_ADDR: 0.0.0.0:8787
       CAIRN_CONTENT_DIR: /content/entries
       # distroless 里没有 /etc/localtime，不设这个 Go 的 time.Local 就是 UTC——
@@ -29,14 +131,29 @@ services:
     # 于是上面那个 user 依然写不进去。它是另一个 private 仓库（见 web/content/README.md），
     # 新机器上 clone 主仓不会带上它——不先 clone 它，条目会落进一个空的、
     # 不受任何 git 管理的目录，「服务器炸了不丢」就没了。
+    # create_host_path: false 就是上面那句「必须先存在」的机器版本——没 clone 内容仓时，
+    # 从前是静默建一个 root 属主的空目录（写入全 500，且条目不受任何 git 管理），
+    # 现在是 up 直接失败。
     volumes:
-      - ../web/content/entries:/content/entries
-    # 只绑回环：公网流量一律经 Caddy。直接可达的 8787 等于把写入通道晾在外面。
-    ports:
-      - "127.0.0.1:8787:8787"
+      - type: bind
+        source: ../web/content/entries
+        target: /content/entries
+        bind:
+          create_host_path: false
+    # 没有 ports。8787 只在 compose 的内部网络上，宿主机上 curl 不到它。
+    # 从前映射到 127.0.0.1:8787 是因为 Caddy 在宿主机上、只能这么够到它；现在两边同网，
+    # 那个映射就只剩下副作用：一个能往磁盘写文件、只靠一个 Bearer token 把门的端点，
+    # 对宿主机上每一个本地进程、每一个 SSH 上来的用户都可达。删掉它，攻击面少一处。
+    # 代价是不能直接在宿主机上 curl 调试，换成：
+    #   docker compose exec caddy wget -qO- http://server:8787/health
+    #   docker compose exec server /cairn-server -healthcheck   # 只有它自己能跑，镜像里没 shell
     healthcheck:
       test: ["CMD", "/cairn-server", "-healthcheck"]
       interval: 30s
       timeout: 3s
       retries: 3
       start_period: 5s
+
+volumes:
+  caddy_data:
+  caddy_config:

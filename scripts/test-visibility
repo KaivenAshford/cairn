@@ -16,11 +16,20 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
 ENTRIES=web/content/entries
+AI_JSON=web/src/data/ai.json
+AI_BACKUP=""
 declare -a MADE=()
 fails=0
 
 cleanup() {
   for f in "${MADE[@]:-}"; do rm -f "$f"; done
+  # 第 21 组会把 web/src/data/ai.json 换成一份空快照再换回来。中途失败（或被 Ctrl-C）
+  # 的话，工作树里就留着一份假数据，而它是**要进 git 的文件**——下次提交就把
+  # 「一天记录都没有」提上去了。所以还原写在 cleanup 里，不写在那一组的末尾。
+  # 用 cp 再删而不是 mv：目标已存在时 cp 保留**目标**的权限位，
+  # 而 mv 会把 mktemp 那份 0600 一起搬过去——一个要进 git 的文件就此变成 0600，
+  # 而这件事在 diff 里看不出来，只在 `git status` 的 mode 变更里闪一下。
+  [ -n "${AI_BACKUP:-}" ] && [ -f "$AI_BACKUP" ] && cp "$AI_BACKUP" "$AI_JSON" && rm -f "$AI_BACKUP"
   rm -rf "$ENTRIES/2026"
   # 测试里那些**故意失败**的构建已经清空过 docroot，并留下一批含条目正文的中间 chunk。
   # 先整个删掉再走安全发布路径：宁可 dist 是空的，也不能是「空的 + 泄露的 .mjs」。
@@ -1152,6 +1161,217 @@ if grep -q "marker.hidden = !kept" web/src/pages/index.astro; then
 else
   bad "筛选脚本没把年份标记的 hidden 记账进去，筛空的年份会留在页面上"
 fi
+
+
+# ── 21. /ai 数据模块：产出的 JSON 里不能有任何原文 ───────────────────────────
+#
+# web/src/data/ai.json 的原料是 ~/.claude/projects 下的 transcript——真实对话、绝对路径、
+# 偶尔还有贴进终端的密钥——而这个文件**要进公开的代码仓**（构建机器上没有 transcript，
+# 读不到就只能带着走）。所以「里面没有原文」不是一条口头约定，是一条要有断言的安全性质，
+# 和第 1 组的「private 不进 dist」是同一类东西：漏了不会有人报 bug，它只是一直公开着。
+#
+# 采集器自己有一道出口闸门（pipeline/ai/gate.go），写盘前拦。这里是第二道，查的是
+# **已经躺在仓库里的那个文件**：它可能被手改过，可能是加闸门之前生成的，也可能是
+# 从别的机器上合并过来的。第一道守写入的那一刻，这一道守仓库的状态。
+#
+# 判据和闸门一样是白名单，而且白到「这份文档里根本没有能装下自由文本的位置」：
+# 字符串值只能是日期，键只能是写死的字段名 / 八个类别名 / 日期，数值只能是整数。
+# 黑名单（「扫一遍看看有没有像密钥的东西」）永远漏，白名单不会。
+ai_scan() { # ai_scan <json> —— 有问题就打印原因并以非零退出
+  node -e '
+const fs = require("fs");
+// 和 pipeline/ai/gate.go 的 schemaKeys / toolClasses 手抄一份。
+// 抄而不是共享：这两处是互相独立的两道闸门，共享一份白名单的话，
+// 往白名单里加一行就能同时把两道都打开。
+const KEYS = new Set([
+  "schema", "updated", "tzOffsetHours", "days",
+  "seen", "prompts", "promptChars", "turns", "toolCalls", "toolErrors", "tools",
+  "bashCmds", "bashPiped", "bashLen", "leverage", "leverageCalls", "hours",
+  "tokens", "projects",
+  "in", "cacheRead", "cacheCreate", "out", "thinking",
+  "count", "topPermille",
+  // 工具类别名。它们是写死在采集器里的封闭集合，不是从数据里长出来的。
+  "执行", "读文件", "改文件", "派活", "外网", "外部服务", "问我", "其他",
+]);
+const DATE = /^\d{4}-\d{2}-\d{2}$/;
+const clip = (s) => (s.length > 12 ? s.slice(0, 12) + "…" : s);
+const bad = [];
+function walk(v, path) {
+  if (v === null) return bad.push(path + " 是 null");
+  if (Array.isArray(v)) return v.forEach((x, i) => walk(x, path + "[" + i + "]"));
+  if (typeof v === "object") {
+    for (const [k, x] of Object.entries(v)) {
+      if (!DATE.test(k) && !KEYS.has(k)) bad.push(path + " 里有不该出现的键 " + JSON.stringify(clip(k)));
+      walk(x, path + "." + k);
+    }
+    return;
+  }
+  if (typeof v === "string") {
+    if (!DATE.test(v)) bad.push(path + " 是一段自由文本 " + JSON.stringify(clip(v)));
+    return;
+  }
+  if (typeof v === "number") {
+    if (!Number.isInteger(v)) bad.push(path + " = " + v + " 不是整数");
+    return;
+  }
+  bad.push(path + " 是 " + typeof v);
+}
+walk(JSON.parse(fs.readFileSync(process.argv[1], "utf8")), "$");
+if (bad.length) { console.log(bad.slice(0, 5).join("；")); process.exit(1); }
+' "$1"
+}
+
+if [ ! -f "$AI_JSON" ]; then
+  bad "$AI_JSON 不在。先跑一次 \`cd pipeline && go run ./ai\`"
+else
+  if why=$(ai_scan "$AI_JSON"); then
+    ok "ai.json 里没有原文：字符串只有日期、键只有写死的那几个、数值全是整数"
+  else
+    bad "ai.json 里有不该出现的东西：$why"
+  fi
+
+  # —— 变异验证 ——
+  # 上面那条断言只能证明「这一份文件是干净的」，证明不了「扫描器真的会抓」。
+  # 所以现场造三份脏的：一段命令原文、一个绝对路径当键、一个存下来的比率。
+  # 三份都必须被同一个扫描器拦住；有一份漏了，上面那条绿灯就是假的。
+  poison=$(mktemp -d)
+  node -e '
+const fs = require("fs");
+const src = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+const day = Object.keys(src.days)[0];
+const w = (name, f) => { const c = JSON.parse(JSON.stringify(src)); f(c); fs.writeFileSync(process.argv[2] + "/" + name, JSON.stringify(c)); };
+if (!day) { console.error("ai.json 里一天都没有，变异验证做不了"); process.exit(2); }
+w("cmd.json",  (c) => { c.days[day].note = "grep -r AKIA /home/z/私密项目/.env | head"; });
+w("path.json", (c) => { c.days[day].tools["/home/z/私密项目"] = 3; });
+w("mcp.json",  (c) => { c.days[day].tools["mcp__gitcode__create_pull_request_comment"] = 3; });
+w("ratio.json",(c) => { c.days[day].seen = 0.42; });
+' "$AI_JSON" "$poison"
+  caught=0
+  for m in cmd path mcp ratio; do
+    if ai_scan "$poison/$m.json" >/dev/null 2>&1; then
+      bad "变异验证：扫描器放行了 $m.json（这条断言是空转的）"
+    else
+      caught=$((caught + 1))
+    fi
+  done
+  [ "$caught" -eq 4 ] && ok "变异验证：命令原文、绝对路径、MCP 工具名、比率，四种脏数据都被拦住"
+  rm -rf "$poison"
+
+  # 这个文件必须进得了 git。根 .gitignore 里那条 `data/` 没有前导斜杠的话，
+  # 它会连 web/src/data/ 一起忽略掉——于是本机看着一切正常，CI 和别的机器上
+  # 根本没有这份数据。这类「只在别处坏」的事，只有断言抓得住。
+  if git check-ignore -q "$AI_JSON" 2>/dev/null; then
+    bad "$AI_JSON 被 .gitignore 忽略了：它进不了仓库，构建机器上就没有这份数据"
+  else
+    ok "ai.json 不被 gitignore（构建机器上没有 ~/.claude/projects，只能靠它进仓库）"
+  fi
+fi
+
+# 页面：图可以少，结论不能少。pipeline/README.md 的铁律是
+# 「每个数据模块必须回答一个具体问题并配一句结论」，做出一堆图表却说不出结论 = 没做。
+# 所以这里数的是 .take（结论）的条数，不是图的条数。
+if [ -f web/dist/ai/index.html ]; then
+  takes=$(grep -o 'class="take"' web/dist/ai/index.html | wc -l | tr -d ' ')
+  if [ "$takes" -ge 6 ]; then
+    ok "/ai 上有 $takes 句结论（每张图配一句，不是配一个图例）"
+  else
+    bad "/ai 上只有 $takes 句结论，图表比结论多——那就是「做出一堆图表但说不出结论」"
+  fi
+
+  # 页面上不能出现任何绝对路径。正文里提到的都是仓库内的相对路径
+  #（pipeline/ai/gate.go 这种），一旦出现 /home /Users /workspace /root，
+  # 那只可能是某个项目名或文件路径从数据里漏到了渲染上。
+  hit=""
+  for pat in '/home/' '/Users/' '/workspace/' '/root/'; do
+    grep -qF "$pat" web/dist/ai/index.html && hit="$hit $pat"
+  done
+  if [ -z "$hit" ]; then
+    ok "/ai 的产物里没有绝对路径"
+  else
+    bad "/ai 的产物里出现了绝对路径:$hit"
+  fi
+else
+  bad "没有生成 /ai 页面"
+fi
+
+# 分桶的标签数必须和采集器的边界数对得上。差一个不会报任何错，
+# 只会让页面上每一个数字都错位一格——「31 次以上」那一格显示的其实是「11–30 次」的数。
+for pair in "leverageBounds:LEVERAGE_LABELS" "bashLenBounds:BASH_LEN_LABELS" "promptCharBounds:PROMPT_CHAR_LABELS"; do
+  gob=${pair%%:*}; tsl=${pair##*:}
+  nb=$(sed -n "s/.*$gob *= *\[\]int{\([^}]*\)}.*/\1/p" pipeline/ai/stat.go | tr ',' '\n' | grep -c '[0-9]')
+  nl=$(sed -n "s/^export const $tsl = \[\(.*\)\];$/\1/p" web/src/lib/ai.ts | tr ',' '\n' | grep -c "'")
+  if [ "$nb" -gt 0 ] && [ "$nl" -eq $((nb + 1)) ]; then
+    ok "$tsl 有 $nl 个标签，对上 $gob 的 $nb 个边界"
+  else
+    bad "$tsl 有 $nl 个标签，而 $gob 有 $nb 个边界（应当是边界数 + 1）"
+  fi
+done
+
+# 空快照：构建不能失败，页面不能出现 NaN。
+# 这条路径是真会走到的——采集器在一台没有 transcript 的机器上跑出来的就是空快照，
+# 而这一页上十几个百分比的分母全部来自这份数据。少写一句「分母为 0 就返回 0」，
+# 线上看到的就是一排 NaN%。
+AI_BACKUP=$(mktemp)
+cp "$AI_JSON" "$AI_BACKUP"
+
+# 一天都没有：这一页该说「还没有采集过」，而不是画一堆零。
+printf '%s\n' '{ "schema": 1, "updated": "2026-01-01", "tzOffsetHours": 8, "days": {} }' > "$AI_JSON"
+if build >/dev/null 2>&1; then
+  if grep -qF '还没有采集过' web/dist/ai/index.html; then
+    ok "一天都没有时 /ai 说的是「还没有采集过」，不是一页零"
+  else
+    bad "空快照下 /ai 没有给出「还没采集」的提示"
+  fi
+else
+  bad "空快照让构建失败了——CI 上第一次拿到这个仓库时就是这个状态"
+fi
+
+# 有记录、但某一类计数是零。这才是真会碰上的那种零：
+# 换一台机器、换一个人，「这两周一条 bash 都没跑」完全可能，
+# 而 bashTotal 是三个百分比的分母。少写一句「分母为 0 就返回 0」，
+# 页面上就是一排 NaN%——而且这一条不能用「一天都没有」去测：
+# 那条路径根本不渲染图，十几个百分比一个都没算过。
+# 从**备份**里取，不从 $AI_JSON 取：上一段刚把它换成了「一天都没有」，
+# 再从那份里挑第一天会挑到 undefined，node 静静地抛异常、文件原样没改，
+# 于是下面这条断言在一份空快照上绿着——实测就是这么绿的。
+if ! node -e '
+const fs = require("fs");
+const s = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const date = Object.keys(s.days)[0];
+if (!date) { console.error("备份里一天都没有"); process.exit(2); }
+const d = s.days[date];
+// 留着 prompts 和 seen（好让这一天算「有记录」），把所有会当分母的计数清零。
+d.turns = 0; d.toolCalls = 0; d.toolErrors = 0; d.tools = {};
+d.bashCmds = 0; d.bashPiped = 0;
+d.bashLen = d.bashLen.map(() => 0);
+d.leverage = d.leverage.map(() => 0);
+d.leverageCalls = d.leverageCalls.map(() => 0);
+d.hours = d.hours.map(() => 0);
+d.tokens = { in: 0, cacheRead: 0, cacheCreate: 0, out: 0, thinking: 0 };
+d.projects = { count: 0, topPermille: 0 };
+s.days = { [date]: d };
+fs.writeFileSync(process.argv[1], JSON.stringify(s, null, 2) + "\n");
+' "$AI_JSON" "$AI_BACKUP"; then
+  bad "造不出「某类计数为 0」的快照，下面两条断言没有真的跑"
+fi
+if build >/dev/null 2>&1; then
+  if grep -q 'NaN' web/dist/ai/index.html; then
+    bad "某一类计数为 0 时 /ai 上出现了 NaN（那个比率的分母是 0）"
+  else
+    ok "某一类计数为 0 时 /ai 上没有 NaN（分母为 0 的比率退回 0%）"
+  fi
+  if grep -qF 'Infinity' web/dist/ai/index.html; then
+    bad "/ai 上出现了 Infinity（有个归一化除了 0）"
+  else
+    ok "某一类计数为 0 时也没有 Infinity（柱子的归一化除数为 0 时退回 0）"
+  fi
+else
+  bad "一天里某类计数为 0 就让构建失败了"
+fi
+cp "$AI_BACKUP" "$AI_JSON"        # cp 而不是 mv，理由见 cleanup()
+rm -f "$AI_BACKUP"
+AI_BACKUP=""
+
 
 echo
 if [ "$fails" -eq 0 ]; then

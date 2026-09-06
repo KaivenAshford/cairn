@@ -39,7 +39,7 @@ var (
 	randomID = regexp.MustCompile(`^[0-9a-f]{32,}$`)
 )
 
-// writeMu 串行化整个读-改-写。见 handleWrite 里的注释。
+// writeMu 串行化整个读-改-写。见 commitEntry 里的注释。
 var writeMu sync.Mutex
 
 // requireToken 挡在写入通道前面。用固定时间比较，避免逐字节试探。
@@ -62,7 +62,7 @@ func (c config) requireToken(next http.Handler) http.Handler {
 
 type writeRequest struct {
 	// ID 为空 = 新建一条（id 由标题或随机数生成，撞名时拒绝）。
-	// 给了 ID = 更新那一条（不存在就按这个 id 新建）。见 handleWrite 的注释。
+	// 给了 ID = 更新那一条（不存在就按这个 id 新建）。见 commitEntry 的注释。
 	ID         string   `json:"id"`
 	Type       string   `json:"type"`
 	Title      string   `json:"title"`
@@ -80,22 +80,33 @@ type writeResponse struct {
 	URL        string `json:"url,omitempty"`
 }
 
-// handleWrite 是这个站的心脏：手机上一条消息 / 终端一个命令 → 磁盘上一条 markdown。
-// 记录类内容的唯一死因是输入摩擦，所以这条链路要短到没有借口不用。
+// writeError 是一次写入失败的原因，外加该回给调用方的状态码。
 //
-// 两种意图，由请求里有没有 id 区分：
-//
-//	没有 id  新建。id 自动生成，撞上已有条目一律拒绝（409），绝不覆盖。
-//	有  id  更新那一条。没提供的字段沿用旧值，created 保留，updated 记为今天。
-//	         那条不存在时就按这个 id 新建。
-//
-// 分开的理由：/now 这类「会被覆盖、不留历史」的单页必须能改，而自动生成 id 的
-// 那条路径上，覆盖只可能是撞名事故——两种意图用同一个语义，总有一种是错的。
+// 抽出这个类型是因为写入逻辑现在有两个入口——HTTP JSON（scripts/n）和 Telegram webhook
+// ——而它们把「失败了」讲给人听的方式完全相反：一个回状态码给 curl，
+// 一个回一句中文给手机上的人（而且必须仍然回 HTTP 200，见 telegram.go 的注释）。
+// 所以核心逻辑只负责说清「为什么失败」，怎么说由入口决定。
+type writeError struct {
+	status int
+	msg    string
+}
+
+func (e *writeError) Error() string { return e.msg }
+
+func failf(status int, format string, a ...any) *writeError {
+	return &writeError{status: status, msg: fmt.Sprintf(format, a...)}
+}
+
+// handleWrite 是写入通道的 HTTP JSON 入口：解 body，其余全交给 commitEntry。
+// 这里只处理「传输层」的两种错误——body 太大、JSON 写错了——因为只有这一层知道有 body。
 func (c config) handleWrite(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 
 	var req writeRequest
 	dec := json.NewDecoder(r.Body)
+	// 这里用严格模式（未知字段 = 400），而 telegram.go 那边**故意不用**：
+	// 这个接口的客户端是 scripts/n，是我们自己写的，多出来的字段只可能是打错了；
+	// Telegram 的 Update 是别人定义的、每个版本都在长的结构。
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		// 「你的 JSON 写错了」和「你的内容太长了」是两回事，客户端得能分开处理。
@@ -108,13 +119,50 @@ func (c config) handleWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.TrimSpace(req.Text) == "" {
-		badRequest(w, "text 不能为空")
+	resp, err := c.commitEntry(req)
+	if err != nil {
+		var we *writeError
+		if !errors.As(err, &we) {
+			// commitEntry 现在只会返回 *writeError；将来漏了一条也不能把内部细节漏出去。
+			log.Printf("写入失败（未分类）：%v", err)
+			we = failf(http.StatusInternalServerError, "internal error")
+		}
+		http.Error(w, we.msg, we.status)
 		return
 	}
+
+	status := http.StatusCreated
+	if resp.Action == "updated" {
+		status = http.StatusOK
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// commitEntry 是这个站的心脏：手机上一条消息 / 终端一个命令 → 磁盘上一条 markdown。
+// 记录类内容的唯一死因是输入摩擦，所以这条链路要短到没有借口不用。
+//
+// 两种意图，由请求里有没有 id 区分：
+//
+//	没有 id  新建。id 自动生成，撞上已有条目一律拒绝（409），绝不覆盖。
+//	有  id  更新那一条。没提供的字段沿用旧值，created 保留，updated 记为今天。
+//	         那条不存在时就按这个 id 新建。
+//
+// 分开的理由：/now 这类「会被覆盖、不留历史」的单页必须能改，而自动生成 id 的
+// 那条路径上，覆盖只可能是撞名事故——两种意图用同一个语义，总有一种是错的。
+//
+// 所有校验都在这里，一条都不在入口里：入口有两个（将来可能更多），
+// 校验只要有一条留在入口上，就一定会有另一个入口漏掉它。
+func (c config) commitEntry(req writeRequest) (writeResponse, error) {
+	var zero writeResponse
+
+	if strings.TrimSpace(req.Text) == "" {
+		return zero, failf(http.StatusBadRequest, "text 不能为空")
+	}
 	if req.ID != "" && !validID.MatchString(req.ID) {
-		badRequest(w, fmt.Sprintf("id 只能用小写字母、数字和连字符，且不超过 63 字符：%q", req.ID))
-		return
+		return zero, failf(http.StatusBadRequest,
+			"id 只能用小写字母、数字和连字符，且不超过 63 字符：%q", req.ID)
 	}
 
 	// 更新是一次读-改-写：先读旧条目拿到它的 visibility/type/title，再整个覆盖回去。
@@ -130,12 +178,11 @@ func (c config) handleWrite(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, errUnparsable):
 			// 不能当成 500：服务器没坏，是这条已有条目的 frontmatter 需要人去看一眼。
 			log.Printf("拒绝更新 %s：%v", req.ID, err)
-			http.Error(w, "这条已有条目的 frontmatter 解析不了，拒绝更新以免抹掉它的旧字段", http.StatusConflict)
-			return
+			return zero, failf(http.StatusConflict,
+				"这条已有条目的 frontmatter 解析不了，拒绝更新以免抹掉它的旧字段")
 		case err != nil:
 			log.Printf("查找条目 %s 失败：%v", req.ID, err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
+			return zero, failf(http.StatusInternalServerError, "internal error")
 		}
 		old = found
 	}
@@ -174,24 +221,20 @@ func (c config) handleWrite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !validTypes[req.Type] {
-		badRequest(w, fmt.Sprintf("未知的 type：%q", req.Type))
-		return
+		return zero, failf(http.StatusBadRequest, "未知的 type：%q", req.Type)
 	}
 	if !validVisibility[req.Visibility] {
-		badRequest(w, fmt.Sprintf("未知的 visibility：%q", req.Visibility))
-		return
+		return zero, failf(http.StatusBadRequest, "未知的 visibility：%q", req.Visibility)
 	}
 	if !validStatus[req.Status] {
-		badRequest(w, fmt.Sprintf("未知的 status：%q", req.Status))
-		return
+		return zero, failf(http.StatusBadRequest, "未知的 status：%q", req.Status)
 	}
 
 	for _, t := range req.Tags {
 		if tagSlug(t) == "" {
-			badRequest(w, fmt.Sprintf(
+			return zero, failf(http.StatusBadRequest,
 				"标签 %q 里没有任何字母、数字或中文，做不出 URL 里的一段。\n"+
-					"标签会变成 /t/<标签>/ 这个页面的地址。", t))
-			return
+					"标签会变成 /t/<标签>/ 这个页面的地址。", t)
 		}
 	}
 
@@ -201,11 +244,10 @@ func (c config) handleWrite(w http.ResponseWriter, r *http.Request) {
 	// 写入回的是 201 和一个 /u/salary-numbers/ 的 URL，而下一次构建整站失败，
 	// 那条本想收起来的内容仍然挂在原来的公开地址上。所以这里就要拒绝。
 	if req.Visibility == "unlisted" && req.ID != "" && !randomID.MatchString(req.ID) {
-		badRequest(w, fmt.Sprintf(
+		return zero, failf(http.StatusBadRequest,
 			"unlisted 的文件名就是 URL，必须是 32 位以上十六进制随机串（openssl rand -hex 16）：%q\n"+
 				"新建 unlisted 不要给 id，服务端会生成；想把已公开的条目收起来请用 visibility: private。",
-			req.ID))
-		return
+			req.ID)
 	}
 
 	now := time.Now()
@@ -223,15 +265,13 @@ func (c config) handleWrite(w http.ResponseWriter, r *http.Request) {
 		var err error
 		if id, err = entryID(req, now); err != nil {
 			log.Printf("生成 id 失败：%v", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
+			return zero, failf(http.StatusInternalServerError, "internal error")
 		}
 	}
 
 	if err := os.MkdirAll(c.contentDir, contentDirMode); err != nil {
 		log.Printf("创建目录 %s 失败：%v", c.contentDir, err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+		return zero, failf(http.StatusInternalServerError, "internal error")
 	}
 
 	path := filepath.Join(c.contentDir, id+".md")
@@ -240,18 +280,15 @@ func (c config) handleWrite(w http.ResponseWriter, r *http.Request) {
 	// 更新时不用：调用方给了明确的 id，覆盖正是它要的。
 	if err := atomicWrite(path, buildEntry(req, created, updated), contentFileMode, old == nil); err != nil {
 		if errors.Is(err, os.ErrExist) {
-			http.Error(w, "该 id 已存在", http.StatusConflict)
-			return
+			return zero, failf(http.StatusConflict, "该 id 已存在")
 		}
 		log.Printf("写入 %s 失败：%v", path, err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+		return zero, failf(http.StatusInternalServerError, "internal error")
 	}
 
 	action, verb := "created", "新建"
-	status := http.StatusCreated
 	if old != nil {
-		action, verb, status = "updated", "更新", http.StatusOK
+		action, verb = "updated", "更新"
 	}
 
 	resp := writeResponse{ID: id, Path: path, Visibility: req.Visibility, Action: action}
@@ -263,9 +300,7 @@ func (c config) handleWrite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("%s条目 %s（%s / %s）", verb, logID(id, req.Visibility), req.Type, req.Visibility)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(resp)
+	return resp, nil
 }
 
 // tagUnsafe 与 web/src/lib/entries.ts 的 tagSlug 保持同一套规则：

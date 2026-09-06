@@ -44,46 +44,48 @@
   标签会变成 `/t/<slug>/` 的目录名;两边不一致的后果是「服务端放行、下次构建失败」,
   而构建失败会让 `scripts/publish` 拒绝换产物,整站冻结到有人手改那个 md。
   和「两处默认值都是 private」同一个道理,`server/write_test.go` 有对照断言钉着。
+- **`pipeline/` 的产出必须过得了出口闸门。** `web/src/data/*.json` 进代码仓、会被公开,
+  而它的原料(`~/.claude/projects` 的 transcript)里有真实对话、文件路径、可能有密钥。
+  闸门(`pipeline/ai/gate.go`)是**白名单**:字符串值只准是日期、键只准是手写的字段名、
+  数值只准是整数,布尔和 null 一律拒。加字段的人必须回来手写白名单——那正是要他停下来想的时刻。
 - **纯私密日记不上网。** 站上只放「至少愿意给一个人看」的东西。
 - 未实现的东西一律拒绝请求(现在 `/circle/*` 返回 501),绝不为了「先跑起来」而放行。
 
-## 当前状态(2026-09-05)
+## 当前状态(2026-09-06)
 
-**基础做扎实了,视觉重做过一轮,出口和 CI 也补齐了。** circle 与 pipeline 停在原地等审核;
-算力接口已明确不做(见 ARCHITECTURE 第 7 节)。
+**基础、视觉、出口、CI 都做完了。手机端写入通道和第一个数据模块也做完了。**
 
-**内容与代码分仓**:真实条目在单独的 private 仓库(clone 到 `web/content/entries/`),
-代码仓里只有 `web/content/fixtures/` 那 3 条示例。详见 ARCHITECTURE.md 第 2 节。
+- **内容与代码分仓**:真实条目在单独的 private 仓库,代码仓只有 fixtures。见 ARCHITECTURE 第 2 节。
+- **视觉是「六色卡纸」**:卡片式时间流,六种 type 各一支色相且**长得不一样**。
+  卡片只有一份实现:`web/src/components/EntryCard.astro`。见 ARCHITECTURE 第 6 节。
+- **出口**:`/feed.xml`(手写 Atom)、`/sitemap.xml`、`/robots.txt`、Open Graph、favicon。
+  三样产物的数据源都是 `publicEntries()`——**绝不能是 `loadEntries()`**。
+- **导航**:标签页 `/t/<slug>/`、条目页上下篇、首页年份标记。
+  `/u/` 故意不加上下篇(会泄露别的 unlisted 条目的 URL)。
+- **手机端写入**:Telegram webhook(`POST /api/telegram`)。两道门——
+  secret token 常量时间比较 + 发信人数字 id allowlist,半配拒绝启动、全不配则路由不注册。
+  默认零语法(发一段字 = log/private);指令词就是 frontmatter 的字段值本身,
+  词表从 `write.go` 的三张校验表在 init 里生成,加一个 type 值手机端自动跟上。
+- **第一个数据模块** `/ai`:`pipeline/` 是独立 Go module,流式读 transcript,
+  按天增量快照(同一天取事件更多的那份,所以在没有 transcript 的机器上跑一遍不会清空历史)。
+- **CI**:`.github/workflows/ci.yml`,三个并行 job(server / commit / web)。
+  注意 CI 上 `web/content/entries/` 不存在,web job 必须先跑 `scripts/seed`。
 
-**视觉是「六色卡纸」**:卡片式时间流,六种 type 各一支色相,卡片**按 type 长得不一样**
-(长文最大、短记是一句话、外链带域名、清单铺前几项、影像铺图)。
-卡片只有一份实现:`web/src/components/EntryCard.astro`,首页和标签页共用——
-它被复制过一次就立刻漂移了(首页加影像分支时标签页没跟上)。
+`server/` **48 个测试**,`pipeline/` **17 个**,`scripts/test-visibility` **92 条**性质。
+三套都做过变异验证(把实现改坏,确认断言真的会失败)。
 
-**站现在有出口了**:`/feed.xml`(手写 Atom)、`/sitemap.xml`、`/robots.txt`、
-Open Graph、内联 SVG 的 favicon(和站徽同一堆石头)。三样产物的数据源都是
-`publicEntries()`——**绝不能是 `loadEntries()`**,那会把 unlisted 的随机 URL
-群发给订阅者、交给搜索引擎。
+**未实现**:`/circle/*` 的会话与渲染、magic link、写入后自动重建、部署。
+`circle` 的前置问题是「哪些内容值得放进去」——那是内容判断,不是工程任务,
+在有第一条真正想放进去的东西之前做了也是空的。
 
-**导航**:标签页 `/t/<slug>/`(标签终于不再是死数据)、条目页的上一篇/下一篇、
-首页的年份标记。`/u/` 的未列出页**故意不加上下篇**——那会把别的 unlisted 条目的
-URL 泄露给拿到其中一条的人。
-
-**CI**:`.github/workflows/ci.yml`,两个并行 job。注意 CI 上 `web/content/entries/`
-不存在(它是另一个仓库),所以 web job 必须先跑 `scripts/seed`。
-
-`server/` 24 个测试(`go test -race` 全过),`scripts/test-visibility` **81 条**性质。
-两套都做过变异验证——把修复改坏,确认测试真的会失败。
-
-**未实现**:`/circle/*` 的会话与渲染、magic link、`pipeline/` 的数据采集、
-手机端写入入口(Telegram bot)、写入后自动重建。
+**明确不做**:算力接口(见 ARCHITECTURE 第 7 节)、搜索、分页、评论、手动暗色切换。
 
 **已知的债**:
-- `.yearmark` 的 `position: sticky` 在 grid item 上活动范围只有自己那一行,
-  不是注释原本描述的那种「浮在那儿」。要那个效果得先把 `.stream` 从 grid 换掉。
-- 条目页用 `.seed`、时间流用 `.status[data-status]`,两套状态标记同时活着。
-- `/now/` 与 `/e/now/` 是同一份内容的两个 URL,canonical 各指各的。
-  sitemap 只推荐 `/now/`,真要收口得改 `Base.astro`。
+- `.yearmark` 的 `position: sticky` 在 grid item 上活动范围只有自己那一行。
+- 条目页用 `.seed`、时间流用 `.status[data-status]`,两套状态标记并存。
+- `/now/` 与 `/e/now/` 的 canonical 各指各的,sitemap 只推荐前者。
+- Telegram 通道**不支持改已有条目**(没有 `-i`):覆盖是整条链路上唯一不可逆的动作,
+  不该放在一块手机键盘后面。
 
 ## 下一步(按这个顺序)
 
@@ -106,6 +108,8 @@ n "刚想到的一件事"                                  # scripts/n,默认 lo
 n -v public -t post -T "标题" "正文"
 n -i now "在建这个站"                               # 按 id 更新已有条目
 n -g tsgo,编译器 "正文"                            # 带标签
+
+cd pipeline && go run ./ai                        # 采集 transcript 统计 → web/src/data/ai.json
 
 scripts/publish                                   # 构建并发布(不要直接 npm run build)
 

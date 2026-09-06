@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -28,6 +29,11 @@ type config struct {
 	// 这个目录是单独的 private 仓库（见 ARCHITECTURE.md 第 2 节）：代码仓里没有内容，
 	// 于是「私密条目被提交进公开仓库」这条不可逆的路径根本不存在。
 	contentDir string
+	// 站点根地址，只用来在 Telegram 的确认里拼一条点得开的链接。
+	// 没配就只回路径（/e/xxx/），不猜域名——猜错的链接比没有链接更浪费一次点击。
+	siteURL string
+	// Telegram 写入通道。没配就整条路由不注册，见 telegram.go。
+	tg telegramConfig
 }
 
 func envOr(key, fallback string) string {
@@ -42,6 +48,7 @@ func loadConfig() (config, error) {
 		addr:       envOr("CAIRN_ADDR", "127.0.0.1:8787"),
 		token:      os.Getenv("CAIRN_TOKEN"),
 		contentDir: filepath.Clean(envOr("CAIRN_CONTENT_DIR", "../web/content/entries")),
+		siteURL:    strings.TrimRight(os.Getenv("CAIRN_URL"), "/"),
 	}
 	// 没有默认 token。一个能往磁盘写文件的接口，绝不能因为忘配环境变量就裸奔。
 	if c.token == "" {
@@ -50,6 +57,12 @@ func loadConfig() (config, error) {
 	if len(c.token) < 32 {
 		return c, errors.New("CAIRN_TOKEN 太短，至少 32 个字符")
 	}
+	// 同样的规矩：Telegram 那条通道要么两道门都配齐，要么根本不开。半配就拒绝启动。
+	tg, err := loadTelegramConfig()
+	if err != nil {
+		return c, err
+	}
+	c.tg = tg
 	return c, nil
 }
 
@@ -80,6 +93,9 @@ func main() {
 	go func() {
 		log.Printf("cairn 服务端监听 %s", cfg.addr)
 		log.Printf("  条目目录 → %s", cfg.contentDir)
+		if cfg.tg.enabled {
+			log.Printf("  Telegram webhook → POST /api/telegram（allowlist %d 人）", len(cfg.tg.allow))
+		}
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("监听失败：%v", err)
 		}
@@ -106,6 +122,15 @@ func routes(cfg config) http.Handler {
 	})
 
 	mux.Handle("POST /api/write", cfg.requireToken(http.HandlerFunc(cfg.handleWrite)))
+
+	// 没配 Telegram 就连路由都不注册（404），而不是注册一个「暂不可用」的端点。
+	// 这条通道的鉴权全在 handler 里（secret token 头 + 发信人 allowlist），
+	// 路径本身不承担任何保密职责——所以它叫 /api/telegram，而不是常见的
+	// 「把 bot token 拼进 URL」那种写法：URL 会进 Caddy 的访问日志和 withLogging，
+	// 密钥放进去等于每收一条消息就把它记一遍。
+	if cfg.tg.enabled {
+		mux.Handle("POST /api/telegram", cfg.telegramRoute())
+	}
 
 	// circle / private 的服务端渲染。见 ../ARCHITECTURE.md 第 3 节：allowlist + magic link。
 	// 还没实现——在实现之前它必须拒绝所有请求。绝不能为了「先跑起来」而暂时放行：

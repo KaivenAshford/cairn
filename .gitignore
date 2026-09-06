@@ -6,7 +6,13 @@ dist.old/
 .astro/
 server/cairn-server
 server/server
-data/
+# 加了前导斜杠：这条要挡的是仓库根上的 data/（session 与一次性 token 的 SQLite，
+# 见 ARCHITECTURE.md 第 5 节）。没有斜杠的 `data/` 会匹配**任意层级**的 data 目录，
+# 于是它连 web/src/data/ 一起挡掉了——而那里放的 ai.json 恰恰必须进仓库
+#（构建机器上没有 ~/.claude/projects，读不到就只能带着走）。
+# 本机看着一切正常，CI 和别的机器上却没有这份数据，这类事只有断言抓得住：
+# scripts/test-visibility 第 21 组现在会 git check-ignore 一下。
+/data/
 
 # 内容：单独的 private 仓库，永远不进这个仓库。
 # 代码仓里只有 web/content/fixtures/ 那几条示例，用 scripts/seed 放进来。

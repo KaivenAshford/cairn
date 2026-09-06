@@ -802,6 +802,161 @@ footer.site::before { top: 0; }
   overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
 }
 
+/* ── /ai：数据页的图 ──────────────────────────────────────────────────────────
+
+   零依赖，所以没有图表库；但这一页要的图（条形、堆叠条、柱状、热力格）本来也不需要——
+   它们的全部内容就是「一个 0–1 的比例变成一段长度或一个深浅」，那正是 CSS 的本职。
+   引一个图表库换来的是 SVG、坐标轴、tooltip 和一百多 KB 的 JS，
+   而这一页一行 JS 都不用跑。
+
+   所有图都用**行内 style 传一个 --v**（0–1 的比例），CSS 只负责把它变成长度。
+   数字本身写在 markup 里的文字上，不写在图里：CSS 关掉、图片不加载、读屏器读过去，
+   这一页都还是完整的——图是给眼睛的第二遍，不是唯一一遍。
+
+   颜色借六型那六支（--c-post…--c-photo）。它们已经锁死了同一条明度带，
+   并排当分类色用正合适；而且暗色下自动换成另一组，这里一个字都不用写。 */
+
+/* 每张图的三段式：小标题（要回答的问题）→ 图 → 结论。
+   结论不是图例。图例说的是「哪根柱子是什么」，结论说的是「所以呢」。 */
+.figure { margin: 0 0 3.4rem; }
+.figure > h2 {
+  font-size: var(--fs-lg); font-weight: 700; line-height: 1.4;
+  letter-spacing: -.005em; margin: 0 0 1rem; text-wrap: balance;
+}
+
+/* 结论那一句：左边一条 3px 的青，字号比正文大一档。
+   它必须比图更显眼——一页图表看完记不住任何数字是常态，能记住的只有句子。 */
+.take {
+  margin: 1rem 0 0; padding: .1rem 0 .1rem 1rem;
+  border-left: 3px solid var(--accent-soft);
+  font-size: var(--fs-md); line-height: 1.75; text-wrap: pretty;
+}
+.take b { color: var(--accent); font-weight: 700; }
+/* 补充说明：口径、免责、数据本身的毛病。比结论安静一档。 */
+.figure > .fine { margin: .8rem 0 0; color: var(--muted); font-size: var(--fs-sm); line-height: 1.7; }
+
+/* —— 数字条 —— */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+  gap: .7rem; margin: 0 0 2.75rem; padding: 0; list-style: none; }
+.stats li {
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-sm);
+  padding: .7rem .85rem; box-shadow: var(--shadow-0), var(--shadow-in);
+}
+.stats .n { display: block; font-size: var(--fs-xl); font-weight: 700; line-height: 1.2;
+  letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.stats .k { display: block; margin-top: .2rem; color: var(--muted); font-size: var(--fs-sm); }
+
+/* —— 横向条形 —— */
+/* 三栏：标签 / 条 / 数值。两侧的栏宽写死成 em 而不是 max-content：
+   每个 li 各自是一个 grid，max-content 会按各行自己的内容算，于是每一行的条
+   起点都不一样——那样长度就没法互相比，条形图就白画了。
+   （不做成整个 ul 一张大 grid，是因为那要求 li 消失或用 subgrid，
+   而 li 消失会把「这是一个 8 项的列表」从无障碍树里一起拿掉。） */
+.bars { list-style: none; margin: 0; padding: 0; display: grid; gap: .4rem; }
+.bars li { display: grid; grid-template-columns: 7em minmax(0, 1fr) 7.5em;
+  align-items: center; gap: .7rem; }
+.bars .k { font-size: var(--fs-ms); white-space: nowrap; }
+.bars .v { font-size: var(--fs-sm); color: var(--muted); font-variant-numeric: tabular-nums;
+  text-align: right; white-space: nowrap; }
+.bars .bar { height: 14px; border-radius: 999px; background: var(--chip-bg); }
+/* 最小 3px。这里给下限、堆叠条那边不给，不是不一致：
+   横条图问的是「哪一类多」，每一行右边就写着精确数字，3px 只是让那一行看着不像忘了画；
+   堆叠条问的是「一整条里各占几分」，给了下限就等于把万分之六画成百分之零点三，
+   那才是一张真的在撒谎的图。 */
+.bars .bar::before {
+  content: ""; display: block; height: 100%; border-radius: 999px;
+  width: max(3px, calc(var(--v) * 100%));
+  background: var(--ch);
+}
+
+/* —— 堆叠条 —— */
+/* 一整条 100%，按 flex-grow 分段。段与段之间不留缝：留缝会让「总和是 1」这件事变糊。 */
+.stack { display: flex; height: 22px; border-radius: 999px; overflow: hidden;
+  background: var(--chip-bg); margin: .35rem 0 0; }
+/* 刻意没有 min-width：小到画不出来的那一段就该画不出来。
+   「真正的新输入」只占万分之六，给它 2px 的下限会让它在屏幕上占百分之零点三——
+   放大五百倍，而这一段的全部意义就是它有多小。它靠图例里的数字和结论那句话被看见。 */
+.stack > i { display: block; background: var(--ch); }
+.stack-label { font-size: var(--fs-sm); color: var(--muted); margin: .9rem 0 0; }
+.stack-label:first-child { margin-top: 0; }
+
+/* —— 图例兼数据表 —— */
+/* 图例和数字合成一件东西。分成两件的话，读者要在色块和下面的表之间来回找对应，
+   而这一页真正要比的就是「同一段在两条里占的比例不一样」。 */
+.legend { list-style: none; margin: 1rem 0 0; padding: 0; display: grid; gap: .3rem;
+  font-size: var(--fs-sm); }
+.legend li { display: grid; grid-template-columns: .8rem max-content minmax(0, 1fr);
+  align-items: baseline; gap: .5rem; }
+.legend .sw { width: .8rem; height: .8rem; border-radius: 3px; background: var(--ch);
+  align-self: center; }
+.legend .k { white-space: nowrap; }
+.legend .v { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* —— 柱状（按天） —— */
+/* 柱子从底部长起来，所以容器 align-items: flex-end。
+   高度用百分比而不是 px：改容器高度不用回来同步改任何一根柱子。 */
+.cols { display: flex; align-items: flex-end; gap: 3px; height: 8rem;
+  margin: 0; padding: 0; list-style: none; }
+.cols li { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column;
+  justify-content: flex-end; height: 100%; }
+.cols .col { border-radius: 3px 3px 0 0; overflow: hidden; display: flex;
+  flex-direction: column; justify-content: flex-end;
+  height: max(3px, calc(var(--v) * 100%)); background: var(--chip-bg); }
+/* 一根柱子里的两段：下面那段是当天最大的那个项目，上面是其余。
+   两段用两支不同的色相（锈红 / 靛蓝），不用「同一支色的深浅」——实测同一支色掺 22%
+   之后对页底只有 1.44:1，等于看不见，于是集中度低的那天柱子会显得比实际矮，
+   高度这条编码就被破坏了。两支色相对页底分别是 3.88:1 和 3.56:1，都过非文字的 3:1。
+   代价是两段之间只有色相差（1.09:1），但页眉那条六色条本来就是这么排的，
+   这里再补一条分隔线反而会跟站上已有的做法不一致。 */
+.cols .top { background: var(--c-post); height: calc(var(--c) * 100%); }
+.cols .rest { background: var(--c-log); flex: 1 1 auto; }
+.axis { display: flex; gap: 3px; margin: .45rem 0 0; padding: 0; list-style: none;
+  font-size: var(--fs-xs); color: var(--muted); font-variant-numeric: tabular-nums; }
+/* 标签一定比它那一格宽（375px 上一格只有十几像素，而「08-23」有五个字符），
+   所以既不折行也不裁：让它溢出自己那一格居中就行，左右邻格都是空的，撞不上。
+   裁的后果实测是「08-23」在窄屏上被折成上下两行；折行的后果是轴比图还高。 */
+.axis li { flex: 1 1 0; min-width: 0; text-align: center; white-space: nowrap; }
+/* 两端那两个标签往里收，不然它们会溢出到版心外面去。 */
+.axis li:first-child { text-align: left; }
+.axis li:last-child { text-align: right; }
+
+/* —— 24 小时热力带 —— */
+/* 一维网格，深浅就是强度。用 color-mix 调深浅而不是 opacity：
+   opacity 会连着底色一起乘，两格相同的值在不同背景上会显出不同的深浅
+   （见文件开头「不用 opacity 表达弱化」）。 */
+.heat { display: grid; grid-template-columns: repeat(24, minmax(0, 1fr)); gap: 2px;
+  margin: 0; padding: 0; list-style: none; }
+/* 非零的格子从 22% 起跳，不从 0 起跳：只有一两次动作的格子按真实比例调出来是
+   1.0x:1，屏幕上就是一块白，读者会以为那个小时也是空的。22% 对页底 1.41:1，
+   是一层看得出来的浅色。代价是最浅那几档之间的差别被压扁了——可以接受，
+   这张图要回答的是「哪几个小时是空的」，不是「7 点和 8 点差多少」。 */
+.heat li { aspect-ratio: 1; border-radius: 3px;
+  background: color-mix(in srgb,
+    var(--ch) calc(22% + var(--v) * 78%), var(--chip-bg)); }
+/* 完全没有动作的格子改画一个空框：
+   「浅到看不出来」和「真的是零」在深浅图上永远分不开，而这一页的结论正好落在那几个零上。
+   描边用 --underline 而不是 --line：后者对页底只有 1.29:1，画了等于没画。 */
+.heat li[data-zero] { background: transparent; box-shadow: inset 0 0 0 1px var(--underline); }
+
+/* —— 空数据 —— */
+.ai-empty { color: var(--muted); }
+
+@media (max-width: 40rem) {
+  /* 15 根柱子在 375px 上每根只剩 20px，还塞得下；但轴上的日期塞不下，
+     所以轴改成只标首末两天（markup 里逢单数隐藏会更碎，不如让它自己省略）。 */
+  .cols { height: 6.5rem; }
+  .axis { font-size: 10px; letter-spacing: -.04em; }
+  /* 24 格保持一行。挤成两行更好看，但下面那条时刻轴就对不上了——
+     一张对不上轴的热力带比一张扁的更没用。改成收紧缝隙、让格子自己变矮。 */
+  .heat { gap: 1px; }
+  .heat li { aspect-ratio: 1 / 1.6; }
+  /* 375px 上 7em 的标签栏加 7.5em 的数值栏只给条剩下五十来像素。
+     改成两行：标签和数值同一行，条自己占一整行。 */
+  .bars li { grid-template-columns: minmax(0, 1fr) max-content; gap: .15rem .6rem; }
+  .bars .bar { grid-row: 2; grid-column: 1 / -1; }
+  .bars .v { text-align: right; }
+}
+
 /* ── 这一版的取舍 ─────────────────────────────────────────────────────────────
    1. 首页不再是「白纸黑字」。21 张卡摞下来是六种颜色的卡纸，比上一版热闹得多。
       如果哪天觉得吵，改一个值就能整体退回去：把六支 w / w2 的 OKLCH 明度从

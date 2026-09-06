@@ -1,0 +1,341 @@
+---
+import Base from '../layouts/Base.astro';
+import {
+  ai, empty, n, cn, pct, share,
+  LEVERAGE_LABELS, BASH_LEN_LABELS,
+} from '../lib/ai';
+
+/*
+ * /ai —— 第一个数据模块。
+ *
+ * pipeline/README.md 给自己定的铁律：**每个数据模块必须回答一个具体问题并配一句结论。**
+ * 所以这一页不是「我的 AI 使用统计」，它问的是一个问题：
+ *
+ *   一个人和一台机器一起干活的时候，工作量到底是怎么分的？
+ *
+ * 六张图各回答它的一个侧面，每张图底下有一句结论。没有结论的图不放上来——
+ * 「今年 commit 1234 次」没人看第二眼。
+ *
+ * 数字全部从 web/src/data/ai.json 现算（见 lib/ai.ts），句子里的每一个数都是插值，
+ * 不是手打的。手打的话，下次采集之后图会变而句子不会，页面就开始撒谎。
+ *
+ * 这一页是纯静态的（内容对每个访客都一样，见 ARCHITECTURE.md 第 1 节），
+ * 而且一行 JS 都不跑。
+ */
+
+// 六型的那六支颜色借来当分类色。它们锁死了同一条明度带，并排看份量一样重，
+// 而且暗色下自动换成另一组（见 global.css 开头）。
+//
+// 只有**颜色真的在编码一样东西**的图才用这一整套（图 1 的六个桶、图 4 的四种去向、
+// 图 5 的两类项目）。两张横条图各自只用一支色：那里长度已经把话说完了，
+// 再让每根柱子换个颜色，读者会先去找「红色代表什么」，然后发现它什么也不代表。
+// ——而且六支色相配八个类别时，第七、八根会绕回去撞上第一、二根，
+// 那时候「同色 = 同类」这条全站规则就直接坏在这一张图上。
+const HUES = ['--c-post', '--c-list', '--c-note', '--c-log', '--c-link', '--c-photo'];
+
+// —— 图 1：杠杆 ——
+const turns = ai.leverage.reduce((a, b) => a + b, 0);
+const idle = ai.leverage[0] ?? 0;                       // 一次动作都没换来的话
+const heavyTurns = ai.leverage[ai.leverage.length - 1] ?? 0;   // 换来 31 次以上的那些
+const heavyCalls = ai.leverageCalls[ai.leverageCalls.length - 1] ?? 0;
+
+// —— 图 2：工具类别 ——
+const toolTotal = ai.tools.reduce((a, [, v]) => a + v, 0);
+const toolMax = ai.tools.length ? ai.tools[0]![1] : 0;
+const run = ai.tools.find(([k]) => k === '执行')?.[1] ?? 0;
+const readFiles = ai.tools.find(([k]) => k === '读文件')?.[1] ?? 0;
+const editFiles = ai.tools.find(([k]) => k === '改文件')?.[1] ?? 0;
+
+// —— 图 3：命令的形状 ——
+const bashTotal = ai.bashLen.reduce((a, b) => a + b, 0);
+const bashMax = Math.max(...ai.bashLen, 0);
+const shortCmds = ai.bashLen[0] ?? 0;                   // 80 字符以内
+const longCmds = (ai.bashLen[3] ?? 0) + (ai.bashLen[4] ?? 0); // 500 以上
+
+// —— 图 5：按天 ——
+const dailyMax = Math.max(...ai.daily.map((d) => d.calls), 0);
+const concentratedDays = ai.daily.filter((d) => d.concentrated).length;
+const mostProjects = Math.max(...ai.daily.map((d) => d.projects), 0);
+
+// —— 图 6：一天里的分布 ——
+const hourMax = Math.max(...ai.hours, 0);
+const peakHour = ai.hours.indexOf(hourMax);
+const quietHours = ai.hours.map((v, h) => [v, h] as const).filter(([v]) => v === 0).map(([, h]) => h);
+// 连续的空档比「一共有几个空格子」有意思：前者是「睡觉」，后者只是个计数。
+function longestQuietRun(zeros: number[]): number[] {
+  let best: number[] = [];
+  let cur: number[] = [];
+  // 绕一圈看 48 个小时，好让跨零点的空档（凌晨那一段）不被切成两截。
+  for (let i = 0; i < 48; i++) {
+    const h = i % 24;
+    if (zeros.includes(h)) {
+      cur.push(h);
+      if (cur.length > best.length && cur.length <= 24) best = [...cur];
+    } else cur = [];
+  }
+  return best;
+}
+const quietRun = longestQuietRun(quietHours);
+
+const description =
+  `${ai.dayCount} 天里，${n(ai.prompts)} 句话换来 ${n(ai.toolCalls)} 次工具调用。` +
+  '一份关于「人和机器怎么分工」的真实统计。';
+---
+
+<Base title="和机器一起干活" description={description}>
+  {empty ? (
+    <p class="ai-empty">
+      还没有采集过。跑一次 <code>cd pipeline &amp;&amp; go run ./ai</code>，
+      它会把 <code>~/.claude/projects</code> 聚合成 <code>web/src/data/ai.json</code>。
+    </p>
+  ) : (
+    <>
+      <div class="tag-head">
+        <h1>和机器一起干活</h1>
+        <p class="count">
+          {ai.first} 到 {ai.last}，{ai.dayCount} 天。数据来自本机的 Claude Code transcript。
+        </p>
+      </div>
+
+      <p>
+        这一页只问一件事：<strong>一个人和一台机器一起干活的时候，工作量到底是怎么分的。</strong>
+        窗口只有两周，所以下面每个问题都是「在两周里就能答」的那种；
+        「今年 commit 一千次」那类结论这里一条都没有。
+      </p>
+
+      <ul class="stats">
+        <li><span class="n">{n(ai.prompts)}</span><span class="k">我说的话</span></li>
+        <li><span class="n">{n(ai.toolCalls)}</span><span class="k">它做的动作</span></li>
+        <li><span class="n">{cn(ai.tokensOut)}</span><span class="k">它写的 token</span></li>
+        <li><span class="n">{cn(ai.tokensInAll)}</span><span class="k">它读的 token</span></li>
+      </ul>
+
+      {/* ── 1 ───────────────────────────────────────────────────────────── */}
+      <section class="figure">
+        <h2>说一句话，换来多少动作？</h2>
+
+        <p class="stack-label">{n(turns)} 句话，按它引发的动作数分成六段</p>
+        <div class="stack">
+          {ai.leverage.map((v, i) => (
+            <i style={`flex:${v};--ch:var(${HUES[i]})`}></i>
+          ))}
+        </div>
+        <p class="stack-label">同样六段，改成看它们各自占掉多少动作</p>
+        <div class="stack">
+          {ai.leverageCalls.map((v, i) => (
+            <i style={`flex:${v};--ch:var(${HUES[i]})`}></i>
+          ))}
+        </div>
+
+        <ul class="legend">
+          {LEVERAGE_LABELS.map((label, i) => (
+            <li style={`--ch:var(${HUES[i]})`}>
+              <span class="sw"></span>
+              <span class="k">{label}</span>
+              <span class="v">{pct(ai.leverage[i] ?? 0, turns)} 的话 · 占 {
+                pct(ai.leverageCalls[i] ?? 0, ai.toolCalls)} 的动作</span>
+            </li>
+          ))}
+        </ul>
+
+        <p class="take">
+          两条一比就散开了：<b>{pct(idle, turns)} 的话它一个动作都没做</b>——那些是在讨论，不是在派活；
+          而换来 31 次以上动作的只有 <b>{n(heavyTurns)} 句</b>（{pct(heavyTurns, turns)}），
+          它们却占掉了 <b>{pct(heavyCalls, ai.toolCalls)} 的全部动作</b>。
+          协作的重量不在聊天上，在少数几句「去把这件事做完」上。
+        </p>
+      </section>
+
+      {/* ── 2 ───────────────────────────────────────────────────────────── */}
+      <section class="figure">
+        <h2>它到底在用哪些工具？</h2>
+
+        <ul class="bars">
+          {ai.tools.map(([label, v]) => (
+            <li>
+              <span class="k">{label}</span>
+              <span class="bar" style={`--v:${share(v, toolMax)};--ch:var(--c-post)`}></span>
+              <span class="v">{n(v)} · {pct(v, toolTotal, 1)}</span>
+            </li>
+          ))}
+        </ul>
+
+        <p class="take">
+          <b>「执行」一类占 {pct(run, toolTotal)}，「读文件」只占 {pct(readFiles, toolTotal, 1)}。</b>
+          它几乎不用那个叫「读文件」的工具——{n(readFiles)} 次读文件、{n(editFiles)} 次改文件，
+          对着 {n(run)} 次跑命令。一条 shell 管道顶得上十次点开文件，
+          于是仓库在它眼里不是一棵能点开的文件树，是一台能敲命令的机器。
+        </p>
+        <p class="fine">
+          口径：工具只记类别不记原名。原名里 <code>mcp__*</code> 那些会说出接了哪些外部服务，
+          而这个问题在类别这一层就能答完（见 pipeline/ai/scan.go）。
+          另外要说清楚：这台机器开着「能用 Bash 就用 Bash」的偏好，上面这个比例有它的一份。
+          但那条偏好只是把趋势推到了头，不是凭空造出来的——
+          一条 <code>grep | head</code> 本来就能顶掉十次「打开文件看一眼」。
+        </p>
+      </section>
+
+      {/* ── 3 ───────────────────────────────────────────────────────────── */}
+      <section class="figure">
+        <h2>那些命令长什么样？</h2>
+
+        <ul class="bars">
+          {ai.bashLen.map((v, i) => (
+            <li>
+              <span class="k">{BASH_LEN_LABELS[i]}</span>
+              <span class="bar" style={`--v:${share(v, bashMax)};--ch:var(--c-log)`}></span>
+              <span class="v">{n(v)} · {pct(v, bashTotal)}</span>
+            </li>
+          ))}
+        </ul>
+
+        <p class="take">
+          <b>{pct(bashTotal - shortCmds, bashTotal)} 的命令超过 80 个字符，
+          {pct(longCmds, bashTotal)} 超过 500，{pct(ai.bashPiped, ai.bashCmds)} 里有管道。</b>
+          这不是在敲命令，是在写一次性的小程序——那个叫 Bash 的工具，
+          真实身份是个脚本运行时。
+        </p>
+        <p class="fine">
+          只量了长度和有没有 <code>|</code>，命令原文一个字节都没有出采集器
+          （见 pipeline/ai/scan.go 的 <code>bashCommand</code>）。
+        </p>
+      </section>
+
+      {/* ── 4 ───────────────────────────────────────────────────────────── */}
+      <section class="figure">
+        <h2>token 都花在哪了？</h2>
+
+        <p class="stack-label">读进去的 {cn(ai.tokensInAll)}</p>
+        <div class="stack">
+          <i style={`flex:${ai.tokensIn.cacheRead};--ch:var(--c-log)`}></i>
+          <i style={`flex:${ai.tokensIn.cacheCreate};--ch:var(--c-note)`}></i>
+          <i style={`flex:${ai.tokensIn.fresh};--ch:var(--c-post)`}></i>
+        </div>
+        <ul class="legend">
+          <li style="--ch:var(--c-log)"><span class="sw"></span><span class="k">重读缓存</span>
+            <span class="v">{cn(ai.tokensIn.cacheRead)} · {pct(ai.tokensIn.cacheRead, ai.tokensInAll, 1)}</span></li>
+          <li style="--ch:var(--c-note)"><span class="sw"></span><span class="k">写进缓存</span>
+            <span class="v">{cn(ai.tokensIn.cacheCreate)} · {pct(ai.tokensIn.cacheCreate, ai.tokensInAll, 1)}</span></li>
+          <li style="--ch:var(--c-post)"><span class="sw"></span><span class="k">真正的新输入</span>
+            <span class="v">{n(ai.tokensIn.fresh)} · {pct(ai.tokensIn.fresh, ai.tokensInAll, 4)}</span></li>
+        </ul>
+
+        <p class="stack-label">写出来的 {cn(ai.tokensOut)}</p>
+        <div class="stack">
+          <i style={`flex:${ai.thinking};--ch:var(--c-link)`}></i>
+          <i style={`flex:${ai.tokensOut - ai.thinking};--ch:var(--c-list)`}></i>
+        </div>
+        <ul class="legend">
+          <li style="--ch:var(--c-link)"><span class="sw"></span><span class="k">思考</span>
+            <span class="v">{cn(ai.thinking)} · {pct(ai.thinking, ai.tokensOut)}（我看不到）</span></li>
+          <li style="--ch:var(--c-list)"><span class="sw"></span><span class="k">正文与工具调用</span>
+            <span class="v">{cn(ai.tokensOut - ai.thinking)} · {pct(ai.tokensOut - ai.thinking, ai.tokensOut)}</span></li>
+        </ul>
+
+        <p class="take">
+          <b>读进去的 token 里，{pct(ai.tokensIn.cacheRead, ai.tokensInAll, 1)} 是重读的缓存；
+          真正的新输入一共只有 {n(ai.tokensIn.fresh)} 个</b>——第一条堆叠条上那一段
+          （{pct(ai.tokensIn.fresh, ai.tokensInAll, 4)}）细到画不出来，那不是画错了，
+          是它真的就这么细：给它补一个「最小可见宽度」等于把它放大五百倍。
+          同一段上下文被反复读了几千遍，这就是「一次对话」的物理形状。
+          另一头，<b>它写出来的每 100 个 token 里有 {pct(ai.thinking, ai.tokensOut, 0).replace('%', '')} 个我永远看不到</b>。
+        </p>
+      </section>
+
+      {/* ── 5 ───────────────────────────────────────────────────────────── */}
+      <section class="figure">
+        <h2>是真的在同时推进好几个项目吗？</h2>
+
+        <ul class="cols" role="img"
+            aria-label={`${ai.dayCount} 天的动作数柱状图：最多的一天 ${n(dailyMax)} 次；` +
+              `其中 ${concentratedDays} 天有八成以上的动作落在同一个项目上。`}>
+          {ai.daily.map((d) => (
+            <li>
+              <span
+                class="col"
+                style={`--v:${share(d.calls, dailyMax)};--c:${d.topPermille / 1000}`}
+                title={`${d.date}：${n(d.calls)} 次动作，${d.projects} 个项目，最大的一个占 ${Math.round(d.topPermille / 10)}%`}
+              >
+                <i class="rest"></i>
+                <i class="top"></i>
+              </span>
+            </li>
+          ))}
+        </ul>
+        <ul class="axis" aria-hidden="true">
+          {ai.daily.map((d, i) => (
+            <li>{i === 0 || i === ai.daily.length - 1 ? d.date.slice(5) : ''}</li>
+          ))}
+        </ul>
+
+        <ul class="legend">
+          <li style="--ch:var(--c-post)"><span class="sw"></span><span class="k">当天最大的那个项目</span>
+            <span class="v">柱子下半段</span></li>
+          <li style="--ch:var(--c-log)"><span class="sw"></span><span class="k">其余项目</span>
+            <span class="v">柱子上半段</span></li>
+        </ul>
+
+        <p class="take">
+          每根柱子是一天的动作数，红色那一段是当天<b>最大的那一个项目</b>占的份额。
+          最多的一天同时碰过 {mostProjects} 个项目，
+          但 <b>{ai.dayCount} 天里有 {concentratedDays} 天，八成以上的动作落在同一个项目上</b>。
+          「并行推进好几个仓库」是错觉，实际是一天一个主战场，换项目发生在天与天之间。
+        </p>
+      </section>
+
+      {/* ── 6 ───────────────────────────────────────────────────────────── */}
+      <section class="figure">
+        <h2>这两周里，有没有一段时间是空的？</h2>
+
+        <ul class="heat" role="img"
+            aria-label={`一天 24 小时的动作分布：${peakHour} 点最多，${quietRun.length} 个小时完全没有动作。`}>
+          {ai.hours.map((v, h) => (
+            <li data-zero={v === 0 ? '' : undefined}
+                style={`--v:${share(v, hourMax)};--ch:var(--c-note)`}
+                title={`${String(h).padStart(2, '0')} 点：${n(v)} 次`}></li>
+          ))}
+        </ul>
+        <ul class="axis" aria-hidden="true">
+          {ai.hours.map((_, h) => <li>{h % 6 === 0 ? h : ''}</li>)}
+        </ul>
+
+        <p class="take">
+          {quietRun.length >= 24 ? (
+            <>这段窗口里一次动作都没有，24 个格子全是空的。</>
+          ) : quietRun.length > 0 ? (
+            <>
+              <b>一天里唯一整段空掉的是 {quietRun[0]} 点到 {(quietRun[quietRun.length - 1]! + 1) % 24} 点，
+              {quietRun.length} 个小时</b>；剩下 {24 - quietRun.length} 个小时格子里全都有动作，
+              峰值在 {peakHour} 点（{n(hourMax)} 次）。
+              空描边的格子是真的零，不是浅到看不出来。
+            </>
+          ) : (
+            <>24 个小时格子里全都有动作，峰值在 {peakHour} 点（{n(hourMax)} 次）。</>
+          )}
+        </p>
+        <p class="fine">
+          时区按 UTC{ai.tzOffsetHours >= 0 ? '+' : ''}{ai.tzOffsetHours} 换算（采集时定的）。
+          换个时区跑一遍，这张图会整体平移，日期的切分也会跟着变——所以偏移量存在了 JSON 里。
+        </p>
+      </section>
+
+      <section class="figure">
+        <h2>这些数字是怎么来的</h2>
+        <p class="fine">
+          原料是 <code>~/.claude/projects</code> 下的 transcript：真实对话、绝对路径、
+          偶尔还有贴进终端的密钥。而这一页的数据要进公开的代码仓，
+          所以 <code>web/src/data/ai.json</code> 里<strong>没有一个字的原文</strong>——
+          它只装得下整数、日期和八个写死的类别名，别的形状在写盘前会被出口闸门拦住
+          （<code>pipeline/ai/gate.go</code>）。项目名一个都不出，只出「当天碰过几个、
+          最大的占几成」。
+        </p>
+        <p class="fine">
+          采集是增量的：transcript 会被清理，所以快照按天累积，
+          同一天有两份观测时整份取更完整的那一份。推论是——在一台没有 transcript 的机器上
+          跑一遍采集器，不会清空任何历史。
+          当前快照 {ai.dayCount} 天，最后一次采集于 {ai.updated}。
+        </p>
+      </section>
+    </>
+  )}
+</Base>

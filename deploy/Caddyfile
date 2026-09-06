@@ -7,6 +7,20 @@ example.com {
 	file_server
 
 	# 只有静态壳做不到的事才转给 Go 服务。见 ARCHITECTURE.md 第 1 节。
+	#
+	# 这一段同时覆盖两条鉴权方式完全不同的路由，所以这里**不能**加任何统一的门禁：
+	#
+	#   /api/write     Authorization: Bearer（scripts/n）
+	#   /api/telegram  X-Telegram-Bot-Api-Secret-Token（Telegram 的 webhook 推送）
+	#
+	# 在这里加 basic_auth 或 IP 白名单看着是「再加一道」，实际是把 Telegram 挡在门外——
+	# 它不会带你的 Bearer token，而且它的出口 IP 段变过。两道门都在 Go 那边：
+	# secret token 证明「请求来自 Telegram」，发信人 allowlist 证明「消息来自我」。
+	# 同理别动 header_up：把未知请求头剥掉就等于剥掉 secret token，
+	# 而症状是「bot 一条也不回」，没有任何地方会说是 Caddy 干的。
+	#
+	# Telegram 只往 443 / 80 / 88 / 8443 推，且证书必须是公开可信的——Caddy 自动签发的
+	# 就是。所以 webhook 不需要在这里多写一行，它本来就在 /api/* 里。
 	handle /api/* {
 		reverse_proxy 127.0.0.1:8787
 	}

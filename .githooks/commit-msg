@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# 提交信息的硬约束。启用：git config core.hooksPath .githooks
+#
+# 规则和理由见 CLAUDE.md 的「提交信息」一节。一句话版本：
+# 这个仓库的「为什么」归宿是代码注释和 ARCHITECTURE.md，不是 commit message——
+# 读 commit 的场合是 `git log --oneline`，没人会展开读四十行。
+set -uo pipefail
+
+msg=$1
+# 去掉注释行和末尾空行，剩下的才是真正的信息
+body=$(grep -v '^#' "$msg" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+n=$(printf '%s\n' "$body" | wc -l | tr -d ' ')
+
+fail() {
+  echo >&2
+  echo >&2 "✗ $1"
+  echo >&2
+  echo >&2 "  提交信息最多三行：标题、空行、一句为什么。"
+  echo >&2 "  写不下的东西不是该压缩，是该换地方——"
+  echo >&2 "    为什么这么改 → 代码注释（改代码的人必然看到）"
+  echo >&2 "    架构决策     → ARCHITECTURE.md"
+  echo >&2 "    进度与状态   → CLAUDE.md"
+  echo >&2 "    调查过程     → audit/"
+  echo >&2
+  echo >&2 "  当前信息（$n 行）："
+  printf '%s\n' "$body" | sed 's/^/    | /' >&2
+  echo >&2
+  exit 1
+}
+
+[ -n "${body//[[:space:]]/}" ] || fail "提交信息是空的。"
+
+if [ "$n" -gt 3 ]; then
+  fail "提交信息有 $n 行，上限是 3 行。"
+fi
+
+subject=$(printf '%s\n' "$body" | head -1)
+
+# 标题长度按显示宽度算：一个汉字占两列，50 列大约是 25 个汉字或 50 个字母。
+# 超了的话 GitHub 的列表页和 `git log --oneline` 都会截断，等于后半句没写。
+width=$(printf '%s' "$subject" | python3 -c '
+import sys, unicodedata
+s = sys.stdin.read()
+print(sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s))
+' 2>/dev/null || printf '%s' "${#subject}")
+if [ "$width" -gt 50 ]; then
+  fail "标题宽度 $width 列，上限 50（约 25 个汉字）。"
+fi
+
+case "$subject" in
+  *。|*.) fail "标题末尾不要句号——它是一行标题，不是一句话。" ;;
+esac
+
+# 第二行必须空：三行格式是「标题 / 空行 / 一句为什么」，
+# 紧挨着标题写正文会让 git 的多数工具把两行连成一句。
+if [ "$n" -ge 2 ]; then
+  second=$(printf '%s\n' "$body" | sed -n '2p')
+  [ -z "${second//[[:space:]]/}" ] || fail "第二行必须留空。"
+fi
+
+# 署名尾注：作者明确要求不要。它们也会占掉三行里的两行。
+if printf '%s\n' "$body" | grep -qiE '^(co-authored-by|claude-session|generated with)'; then
+  fail "不要署名尾注（Co-Authored-By / Claude-Session）。"
+fi
+
+exit 0

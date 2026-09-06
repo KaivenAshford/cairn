@@ -61,6 +61,36 @@ jobs:
         # 「并发不丢内容」这条断言不开竞态检测就只是碰运气。
         run: go test -race ./...
 
+  # hook 要 clone 之后手动 `git config core.hooksPath .githooks` 才生效，容易忘。
+  # 这一关是兜底：hook 漏掉的、或者在别的机器上提交的，在这里被挡住。
+  commit:
+    name: 提交信息
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 检查这次推上来的提交
+        run: |
+          base="${{ github.event.before }}"
+          # 新分支或首次推送时 before 是全零，那就只查 HEAD
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            range="HEAD~0..HEAD"
+          else
+            range="$base..${{ github.sha }}"
+          fi
+          fail=0
+          for sha in $(git rev-list "$range" 2>/dev/null || echo "${{ github.sha }}"); do
+            git log -1 --format=%B "$sha" > /tmp/msg
+            if ! .githooks/commit-msg /tmp/msg; then
+              echo "::error::$sha 的提交信息不合规"
+              fail=1
+            fi
+          done
+          exit $fail
+
   web:
     name: web（Astro）+ 可见度性质
     runs-on: ubuntu-latest

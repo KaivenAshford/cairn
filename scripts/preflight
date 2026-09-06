@@ -160,7 +160,7 @@ listeners() { # listeners <端口> [tcp|udp]
     if [ "$proto" = udp ]; then ss -lnupH 2>/dev/null; else ss -lntpH 2>/dev/null; fi |
       awk -v p=":$p\$" '$4 ~ p { proc = ""; for (i = 5; i <= NF; i++) proc = proc " " $i; print $4 proc }'
   elif have netstat; then
-    netstat -ln${proto:0:1}p 2>/dev/null | awk -v p=":$p\$" '$4 ~ p { print $4 " " $7 }'
+    netstat "-ln${proto:0:1}p" 2>/dev/null | awk -v p=":$p\$" '$4 ~ p { print $4 " " $7 }'
   elif [ "$proto" = tcp ]; then
     (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null && echo "127.0.0.1:$p ?（只能从回环探到，看不出是谁）"
   fi
@@ -588,7 +588,7 @@ sec_content() {
     # 先扫掉上一次被打断时留下的探针（名字带 pid，所以会一次次攒着）。
     # 这一行不是「顺手打扫」：留着的那个会让 scripts/deploy 永远跳过内容仓的 pull，
     # 理由见文件顶上 PROBE 那段。
-    local stale; stale=$(ls -1 "$dir"/.preflight-probe-* 2>/dev/null | wc -l | tr -d ' ')
+    local stale; stale=$(find "$dir" -maxdepth 1 -name '.preflight-probe-*' 2>/dev/null | wc -l | tr -d ' ')
     [ "${stale:-0}" -gt 0 ] && rm -f "$dir"/.preflight-probe-* 2>/dev/null &&
       warn "清掉了 $stale 个上次没删干净的写权限探针（.preflight-probe-*）" \
            "它是这个脚本自己留下的：上一次跑到一半被 Ctrl-C 或 timeout 杀掉了" \
@@ -754,14 +754,14 @@ sec_domain() {
     myip=""
   done
   if [ -z "$myip" ]; then
-    warn "$dnshost 解析到 $(one_line "$(echo $ips)")，但拿不到本机公网 IP，没法比对" \
+    warn "$dnshost 解析到 $(one_line "$(printf %s "$ips" | tr "\n" " ")")，但拿不到本机公网 IP，没法比对" \
          "自己确认一眼：那个 IP 是不是这台机器"
     return
   fi
-  if printf '%s\n' $ips | grep -qx "$myip"; then
+  if printf '%s' "$ips" | grep -qxF "$myip"; then
     ok "$dnshost 解析到 $myip，就是本机"
   else
-    warn "$dnshost 解析到 $(one_line "$(echo $ips)")，而本机公网 IP 是 $myip" \
+    warn "$dnshost 解析到 $(one_line "$(printf %s "$ips" | tr "\n" " ")")，而本机公网 IP 是 $myip" \
          "对不上的话证书签不下来：ACME 的挑战会打到那个 IP 上，不是这台机器" \
          "套了 CDN / 代理（Cloudflare 那类）的话，对不上是正常的，忽略即可" \
          "没套的话，就是 A 记录还没改、或者还没生效（dig +trace $dnshost 看一眼）"
@@ -818,6 +818,7 @@ sec_build() {
     # 完全对不上（实测如此，Caddyfile 顶上那段注释也记了这一脚），而自检要是照抄这句话，
     # 就是**它自己制造了一个「症状和原因对不上」的故障**，比不查还坏。
     local out cv miss="" ; local -a cenv=()
+    # shellcheck disable=SC2013  # 抓的是 Caddyfile 里的变量名，按定义不含空白
     for cv in $(grep -oE '\{\$[A-Za-z_][A-Za-z0-9_]*' "$CADDYFILE" 2>/dev/null | sed 's/^{\$//' | sort -u); do
       if [ -n "$(envget "$cv")" ]; then cenv+=("$cv=$(envget "$cv")"); else miss="$miss $cv"; fi
     done

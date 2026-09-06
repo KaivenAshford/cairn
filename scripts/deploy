@@ -70,7 +70,6 @@ SELF_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$SELF_DIR/.." && pwd)
 ENVFILE="$ROOT/.env"
 COMPOSE="$ROOT/deploy/docker-compose.yml"
-CADDYFILE="$ROOT/deploy/Caddyfile"
 ASTROCFG="$ROOT/web/astro.config.mjs"
 
 MODE=first          # first | update
@@ -452,7 +451,7 @@ sec_env() {
   # 不是机器在哪个时区——而 VPS 出厂几乎都是 UTC，照抄机器的话正好踩中上面那一脚。
   # 所以：机器上有一个不是 UTC 的时区就用它（那多半是人自己设过的），否则退回
   # .env.example 里那个默认值，并且说出来。
-  tz=$(cat /etc/timezone 2>/dev/null | tr -d '[:space:]')
+  tz=$(tr -d '[:space:]' < /etc/timezone 2>/dev/null)
   case "$tz" in ""|UTC|Etc/UTC|GMT) tz=Asia/Shanghai; TZ_GUESSED=1 ;; esac
 
   # 半配 = 服务端拒绝启动，所以这里也拒绝写出一份半配的 .env。正常路径上 tg_identify
@@ -556,6 +555,7 @@ sec_env() {
   # 而那时候人已经在等部署完成了。在这里先拦住。
   if ! dry; then
     local miss="" v
+    # shellcheck disable=SC2013  # 抓的是 shell 变量名，按定义不含空白
     for v in $(grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*:\?' "$COMPOSE" | sed 's/^\${//; s/:?$//' | sort -u); do
       envhas "$v" || miss="$miss $v"
     done
@@ -637,9 +637,11 @@ sec_content() {
       # 非交互时不猜：给出命令让人自己敲。
       if [ "$(id -u)" -eq 0 ] || [ "$du" = "$(id -u)" ]; then
         if confirm "把 $dir 的属主从 uid $du 改成 $wu？（chown -R，不可逆）"; then
-          chown -R "$wu:$(envget CAIRN_GID)" "$dir" 2>/dev/null &&
-            ok "属主从 uid $du 改成 $wu（容器就是以它跑的）" ||
+          if chown -R "$wu:$(envget CAIRN_GID)" "$dir" 2>/dev/null; then
+            ok "属主从 uid $du 改成 $wu（容器就是以它跑的）"
+          else
             die "chown 失败" "sudo chown -R $wu:$(envget CAIRN_GID) '$dir'"
+          fi
         else
           die "内容目录属于 uid $du，而容器会以 uid $wu 跑 → 每条写入都返回 500" \
               "要么改属主，要么把 .env 的 CAIRN_UID 改成 $du" \
@@ -918,7 +920,7 @@ sec_verify() {
   # curl 的 %{scheme} 在不少版本上回的是大写的 HTTPS（实测 8.5 就是），
   # 直接和小写比会得到一句「是 200，但走的不是 https（HTTPS）」——自己制造一个
   # 症状和原因对不上的故障。压成小写再比。
-  local scheme; scheme=$(curl "${CURL_BASE[@]}" -o /dev/null -w '%{scheme}' "https://$DOMAIN/" 2>/dev/null | tr 'A-Z' 'a-z')
+  local scheme; scheme=$(curl "${CURL_BASE[@]}" -o /dev/null -w '%{scheme}' "https://$DOMAIN/" 2>/dev/null | tr '[:upper:]' '[:lower:]')
   [ "$scheme" = https ] || die "首页是 200，但走的不是 https（$scheme）"
   ok "首页 200，走的是 HTTPS（等了 ${waited}s）"
 

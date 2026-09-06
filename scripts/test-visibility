@@ -22,6 +22,7 @@ PF_TMP=""
 declare -a MADE=()
 fails=0
 
+# shellcheck disable=SC2317  # 由下面的 trap 调用，shellcheck 追不到这条路径
 cleanup() {
   for f in "${MADE[@]:-}"; do rm -f "$f"; done
   # 第 21 组会把 web/src/data/ai.json 换成一份空快照再换回来。中途失败（或被 Ctrl-C）
@@ -99,7 +100,7 @@ if build >/dev/null; then
     if leaks "$marker"; then bad "private/circle 的 '$marker' 出现在了 dist 里"; hit=1; fi
   done
   [ "$hit" -eq 0 ] && ok "private 与 circle 的标题、正文、标签、id 都不进 dist"
-  if [ -e web/dist/e/$T-private ] || [ -e web/dist/e/$T-circle ]; then
+  if [ -e "web/dist/e/$T-private" ] || [ -e "web/dist/e/$T-circle" ]; then
     bad "private/circle 条目生成了页面"
   else
     ok "private 与 circle 条目不生成页面"
@@ -224,6 +225,7 @@ rm -rf "$ENTRIES/2026"
 #
 # 注意下面那个标记不带下划线：带的话，「下划线被当斜体吃掉」这条缺陷会连标记一起改写，
 # grep 于是永远匹配不到，测试看起来通过了——一个测自己测不出来的测试。
+# shellcheck disable=SC2016  # 这是条目正文，里面的 ` 和 $ 都要原样落盘
 entry "$T-excerpt" '---
 type: log
 visibility: public
@@ -694,7 +696,7 @@ if build >/dev/null; then
   if [ -d web/dist/t/a-b ] && [ -d "web/dist/t/前端-后端" ]; then
     ok "含 / 和 & 的标签被折成安全 slug，产物落在 /t/ 内"
   else
-    bad "折叠后的标签页没有落在 /t/a-b/ 和 /t/前端-后端/：$(ls web/dist/t 2>/dev/null | tr '\n' ' ')"
+    bad "折叠后的标签页没有落在 /t/a-b/ 和 /t/前端-后端/：$(find web/dist/t -maxdepth 1 -mindepth 1 -printf "%f\n" 2>/dev/null | tr '\n' ' ')"
   fi
 else
   bad "含 / 的标签让构建失败了——它应当被折成 a-b，而不是被拒绝"
@@ -1580,8 +1582,12 @@ fi
 if scripts/preflight --only nosuchsection >/dev/null 2>&1; then
   bad "--only 写了个不存在的节名，preflight 居然退了 0"
 else
-  rc=$?; [ "$rc" -eq 64 ] && ok "--only 写错时退 64（用法错误，和「64 条致命」撞不上：致命数封在 63）" \
-                          || bad "--only 写错时退的是 $rc，不是 64"
+  rc=$?
+  if [ "$rc" -eq 64 ]; then
+    ok "--only 写错时退 64（用法错误，和「64 条致命」撞不上：致命数封在 63）"
+  else
+    bad "--only 写错时退的是 $rc，不是 64"
+  fi
 fi
 
 # —— 它必须是只读的。一个「部署前自检」如果会改东西，人就不敢在出问题时随手跑它，
@@ -1674,8 +1680,12 @@ fi
 if scripts/deploy --no-such-flag >/dev/null 2>&1; then
   bad "scripts/deploy 收到不认识的参数居然退了 0"
 else
-  rc=$?; [ "$rc" -eq 64 ] && ok "不认识的参数退 64（用法错误，和别的退出码撞不上）" \
-                          || bad "不认识的参数退的是 $rc，不是 64"
+  rc=$?
+  if [ "$rc" -eq 64 ]; then
+    ok "不认识的参数退 64（用法错误，和别的退出码撞不上）"
+  else
+    bad "不认识的参数退的是 $rc，不是 64"
+  fi
 fi
 
 # 造一份最小仓库。内容目录先 git init 好：不这么做的话脚本会**停下来问**
@@ -1706,8 +1716,11 @@ dp_left=""
 for f in .env web/dist web/astro.config.mjs.bak; do
   [ -e "$DP_TMP/repo/$f" ] && dp_left="$dp_left $f"
 done
-[ -z "$dp_left" ] && ok "--dry-run 没生成 .env、没构建 dist、没留下 sed 的 .bak" \
-                  || bad "--dry-run 留下了：$dp_left"
+if [ -z "$dp_left" ]; then
+  ok "--dry-run 没生成 .env、没构建 dist、没留下 sed 的 .bak"
+else
+  bad "--dry-run 留下了：$dp_left"
+fi
 # 而且它得**说出**打算做什么，否则「什么都没改」是靠什么都没做换来的。
 if grep -q '生成.*\.env' "$DP_TMP/out" && grep -q 'docker compose' "$DP_TMP/out"; then
   ok "--dry-run 把要做的事列了出来（生成 .env、起容器都在计划里）"
@@ -1829,6 +1842,22 @@ if [ "$(grab_envget scripts/deploy | md5sum)" = "$(grab_envget scripts/preflight
 else
   bad "两份 envget 漂移了 —— preflight 说配好了、deploy 读出来是空的，而两边都不报错"
   diff <(grab_envget scripts/deploy) <(grab_envget scripts/preflight) | sed 's/^/      /' >&2
+fi
+
+# ── shell 脚本的静态检查 ────────────────────────────────────────────────────
+# CI 里有同一条，这里再跑一遍是为了**在 push 之前**就发现——上一次是推上去了
+# 才看到 CI 红。装了 shellcheck 就跑，没装就说一声跳过（开发机上不该为了跑测试装东西）。
+# 两个部署脚本加起来两千行，而它们是 set -uo pipefail 不带 -e：
+# 任何一处漏判返回值都会静默往下走，而 shellcheck 抓的正是这一类。
+if command -v shellcheck >/dev/null 2>&1; then
+  if sc_out=$(shellcheck -e SC1090,SC1091 scripts/* .githooks/commit-msg 2>&1); then
+    ok "shellcheck 干净"
+  else
+    bad "shellcheck 有 $(printf '%s\n' "$sc_out" | grep -c '^In ') 处"
+    printf '%s\n' "$sc_out" | grep '^In ' | head -5 | sed 's/^/      /' >&2
+  fi
+else
+  printf '  \033[33m–\033[0m shellcheck 没装，跳过（CI 里会跑）\n'
 fi
 
 echo
